@@ -28,6 +28,7 @@ from nvdiffrast_render.camera import (  # pylint: disable=wrong-import-position
 
 GNM_68_FILE = REPO / "gnm" / "shape" / "data" / "landmarks" / "head_sparse_68.txt"
 GNM_68_IBUG_FILE = ROOT / "head_sparse_68_ibug_order.txt"
+V3_68_FILE = ROOT.parent / "MediaPipe" / "head_sparse_68_v3_改.txt"
 
 
 def main() -> int:
@@ -38,7 +39,8 @@ def main() -> int:
       "--gt68_map",
       choices=("star", "identity", "mp68", "mp2dlib", "mp68_ibug", "mp68_v1"),
       default="star",
-      help="2D 68 GT. star/identity = already iBUG 68 (STAR). "
+      help="2D 68 GT. star/identity = already iBUG 68, paired with "
+           "MediaPipe/head_sparse_68_v3_改.txt. "
            "mp* = take 68 from MediaPipe 468 (legacy).",
   )
   p.add_argument("--landmark_file", type=Path, default=None)
@@ -54,7 +56,7 @@ def main() -> int:
           lmk_sets.write_gnm68_ibug_order(GNM_68_FILE, GNM_68_IBUG_FILE)
         args.landmark_file = GNM_68_IBUG_FILE
       else:
-        args.landmark_file = GNM_68_FILE
+        args.landmark_file = V3_68_FILE
     else:
       args.landmark_file = ROOT / "head_dense_468.txt"
 

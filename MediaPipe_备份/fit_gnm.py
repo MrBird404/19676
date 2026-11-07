@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """GNM v3 HEAD landmark fit — VHAP-style 3-stage + true-perspective camera.
 
-``--lmk_set sparse68`` (default): 2D GT is STAR/iBUG 68, 3D is official
-GNM ``head_sparse_68.txt``. ``dense468`` is the legacy MediaPipe path.
+``--lmk_set sparse68`` (default): 2D GT is iBUG 68, 3D is
+``MediaPipe/head_sparse_68_v3_改.txt``. ``dense468`` is the legacy MediaPipe path.
 
 Camera: OpenGL-like K + RT (no weak-perspective, no vertex [1,-1,-1] bake).
 World = GNM native. Projection matches ``nvdiffrast_render.camera``.
 
 Stages:
-  1. rigid      — cam (aa,t,focal) + GNM joints/translation; uniform w=1
-  2. shape      — identity (+ expression if mouth on)；轮廓/鼻/眉/眼 + 高权唇/嘴
-  3. expression — lower_face；嘴高权、冻结 identity
+  1. rigid      — camera + head rigid body (neck root + translation). No identity,
+     expression, jaw, or eyes. ``vhap_monocular`` matches VHAP ``lmk_init_rigid``.
+  2. shape      — identity, joints, expression, and pose together (landmark only).
+  3. expression — optional later refine. ``--stop_after shape`` skips it.
+     Photometric fitting stays off unless ``--photometric``. It compares
+     rendered color to the white-background frame. There is no mask-contour loss.
 
 Each stage writes a photo GT/pred overlay and a true-perspective mesh head
 with the current 68 (or 468) landmarks:
@@ -37,6 +40,7 @@ ROOT = Path(__file__).resolve().parent
 REPO = ROOT.parent / "GNM-main"
 GNM_68_FILE = REPO / "gnm" / "shape" / "data" / "landmarks" / "head_sparse_68.txt"
 GNM_68_IBUG_FILE = ROOT / "head_sparse_68_ibug_order.txt"
+V3_68_FILE = ROOT.parent / "MediaPipe" / "head_sparse_68_v3_改.txt"
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(ROOT))
 
@@ -510,7 +514,8 @@ def main() -> int:
       "--gt68_map",
       choices=("star", "identity", "mp68", "mp2dlib", "mp68_ibug", "mp68_v1"),
       default="star",
-      help="2D 68 GT. star/identity = STAR/iBUG 68 paired with official GNM 68. "
+      help="2D 68 GT. star/identity = already iBUG 68, paired with "
+           "MediaPipe/head_sparse_68_v3_改.txt. "
            "mp* = subset from MediaPipe 468 (legacy).",
   )
   p.add_argument("--landmark_file", type=Path, default=None)
@@ -533,6 +538,13 @@ def main() -> int:
       default="default",
       help="vhap_monocular: VHAP base LossWeightConfig + lmk_init_* style stages "
            "(balanced mouth boost=1, nose×10, reg_expr/shape/jaw_yz).",
+  )
+  p.add_argument(
+      "--stop_after",
+      choices=("rigid", "shape", "all"),
+      default="all",
+      help="rigid: camera + head rigid only. shape: then identity/joints/expr/pose. "
+           "all: also the later expression refine. Never runs a mask-contour loss.",
   )
   p.add_argument("--rigid_iters", type=int, default=500)
   p.add_argument("--shape_iters", type=int, default=1000)
@@ -584,6 +596,18 @@ def main() -> int:
       action="store_true",
       help="Fit the mouth with the 150 lower-face expression coefficients.",
   )
+  p.add_argument(
+      "--photometric",
+      action="store_true",
+      help="After landmarks: texture+SH, then color pulls shape, then static offset. No mask contour.",
+  )
+  p.add_argument("--mask", type=Path, default=None, help="Unused. Masks are for compositing, not a loss.")
+  p.add_argument("--photo_max_side", type=int, default=1024)
+  p.add_argument("--photo_tex_res", type=int, default=256)
+  p.add_argument("--photo_tex_iters", type=int, default=400)
+  p.add_argument("--photo_iters", type=int, default=400)
+  p.add_argument("--photo_offset_iters", type=int, default=250)
+  p.add_argument("--photo_mask_iters", type=int, default=0, help="Ignored. Silhouette stage is not used.")
   p.add_argument("--reg_id", type=float, default=0.05)
   p.add_argument("--reg_ex", type=float, default=0.03)
   p.add_argument("--reg_joint", type=float, default=0.05)
@@ -657,7 +681,7 @@ def main() -> int:
           lmk_sets.write_gnm68_ibug_order(GNM_68_FILE, GNM_68_IBUG_FILE)
         args.landmark_file = GNM_68_IBUG_FILE
       else:
-        args.landmark_file = GNM_68_FILE
+        args.landmark_file = V3_68_FILE
     else:
       args.landmark_file = ROOT / "head_dense_468.txt"
   if args.lmk_set == "sparse68" and args.gt68_map == "mp2dlib":
@@ -973,7 +997,12 @@ def main() -> int:
     return m
 
   stage_bgr = None
-  if video_path:
+  if "image_paths" in lmk_npz.files:
+    img_path = str(lmk_npz["image_paths"][args.frame_index])
+    stage_bgr = cv2.imread(img_path)
+    if stage_bgr is None:
+      print(f"[warn] cannot read image_paths[{args.frame_index}] {img_path}", flush=True)
+  if stage_bgr is None and video_path:
     src = Path(video_path)
     if src.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}:
       stage_bgr = cv2.imread(str(src))
@@ -1183,24 +1212,37 @@ def main() -> int:
         kept.append({**group, "params": params})
     return kept
 
-  # Stage1: rigid — camera + joints
-  run_stage(
+  # Stage1: camera + head rigid body. Neck is the GNM root, so it is the
+  # rigid rotation. Jaw (rot_head) and eyes stay at zero — they change the face.
+  if args.preset == "vhap_monocular":
+    rigid_groups = [
+        {"params": [state.rot_neck], "lr": args.lr_pose},
+        {"params": [state.cam_aa], "lr": args.lr_pose},
+        {"params": [state.cam_t], "lr": args.lr_cam},
+        {"params": [state.focal_norm], "lr": args.lr_cam * 0.2},
+        {"params": [state.translation], "lr": args.lr_pose * 0.2},
+    ]
+  else:
+    rigid_groups = [
+        {"params": [state.rot_neck, state.rot_head], "lr": args.lr_pose},
+        {"params": [state.cam_aa], "lr": args.lr_pose},
+        {"params": [state.cam_t], "lr": args.lr_cam},
+        {"params": [state.focal_norm], "lr": args.lr_cam * 0.2},
+        {"params": [state.translation], "lr": args.lr_pose * 0.2},
+    ]
+  last = run_stage(
       "gnm_lmk_init_rigid",
       args.rigid_iters,
-      trainable([
-          {"params": [state.rot_neck, state.rot_head], "lr": args.lr_pose},
-          {"params": [state.cam_aa], "lr": args.lr_pose},
-          {"params": [state.cam_t], "lr": args.lr_cam},
-          {"params": [state.focal_norm], "lr": args.lr_cam * 0.2},
-          {"params": [state.translation], "lr": args.lr_pose * 0.2},
-      ]),
+      trainable(rigid_groups),
       w_rigid,
       reg_id=False,
       reg_ex=False,
       reg_joints=True,
   )
   dump_stage("1_rigid", f"stage1 rigid only ({args.lmk_set})", stage_bgr)
-  if args.preset == "safe_expr":
+  if args.stop_after == "rigid":
+    print("[stop_after=rigid] landmark rigid done; shape and later stages skipped", flush=True)
+  elif args.preset == "safe_expr":
     state.focal_norm.requires_grad_(False)
     fx = float(state.focal_norm) * float(max(width, height))
     print(
@@ -1238,10 +1280,9 @@ def main() -> int:
     else:
       print("[safe_expr] identity stage skipped, mouth uses expression directions", flush=True)
 
-  # Stage2: shape — identity (+ expression if mouth in loss)
-  # VHAP lmk_init_all: always optimize shape + joints + expr together.
+  # Stage2: identity, joints, expression, and pose together. Landmark only.
   # safe_expr 的身份已经在上面单独跑过。
-  if args.preset != "safe_expr":
+  if args.stop_after != "rigid" and args.preset != "safe_expr":
     shape_groups = [
         {"params": [state.id_head, state.id_eyes], "lr": args.lr_id},
         {"params": [state.rot_leye, state.rot_reye], "lr": args.lr_pose},
@@ -1252,7 +1293,7 @@ def main() -> int:
     ]
     if shape_mouth > 0 or args.preset == "vhap_monocular":
       shape_groups.insert(1, {"params": [state.ex_lower], "lr": args.lr_ex})
-    run_stage(
+    last = run_stage(
         "gnm_lmk_init_shape",
         args.shape_iters,
         trainable(shape_groups),
@@ -1268,7 +1309,8 @@ def main() -> int:
         stage_bgr,
     )
 
-  if args.preset != "safe_expr" and args.mouth_open_iters > 0:
+  run_later = args.stop_after == "all"
+  if run_later and args.preset != "safe_expr" and args.mouth_open_iters > 0:
     print(
         f"==> mouth-open AFTER shape  iters={args.mouth_open_iters}  "
         f"w_open={args.w_mouth_open}  jaw_w={args.mouth_open_jaw_weight}  "
@@ -1292,7 +1334,11 @@ def main() -> int:
 
   # 嘴只用前 24 个分量，并惩罚唇点朝相机（+Z）探出。下颌铰链不动。
   # 检测到闭口时，上下内唇保持贴住，唇线的表情仍然拟合。
-  if args.preset == "safe_expr" and (args.mouth_basis or args.identity_from is not None):
+  if (
+      run_later
+      and args.preset == "safe_expr"
+      and (args.mouth_basis or args.identity_from is not None)
+  ):
     w_lip = np.full(68, 0.15, dtype=np.float32)
     w_lip[27:36] = 10.0
     w_lip[48:68] = 1.0
@@ -1378,7 +1424,7 @@ def main() -> int:
         {"params": [state.rot_head], "lr": args.lr_pose * 0.15},
         {"params": [state.rot_leye, state.rot_reye], "lr": args.lr_pose * 0.3},
     ]
-  else:
+  elif run_later:
     vhap_stage3 = args.preset == "vhap_monocular" or args.expr_base_weight > 0
     expr_groups = [
         {"params": [state.ex_lower], "lr": args.lr_ex},
@@ -1393,6 +1439,12 @@ def main() -> int:
           {"params": [state.cam_t, state.focal_norm], "lr": args.lr_cam * 0.2},
           {"params": [state.translation], "lr": args.lr_pose * 0.15},
       ])
+  if not run_later:
+    expr_groups = []
+    print(
+        f"[stop_after={args.stop_after}] later expression refine skipped; no mask loss",
+        flush=True,
+    )
   if expr_groups:
     expr_groups = trainable(expr_groups)
     last = run_stage(
@@ -1418,6 +1470,38 @@ def main() -> int:
         ),
         stage_bgr,
     )
+
+  photo_stats: dict = {}
+  if args.photometric and args.stop_after != "all":
+    print("[stop_after] photometric / mask stage skipped", flush=True)
+  elif args.photometric:
+    import photo_fit  # pylint: disable=import-outside-toplevel
+
+    photo_stats = photo_fit.run_photometric(
+        args=args,
+        state=state,
+        gnm=gnm,
+        gnm_np=gnm_np,
+        posed_verts_world=posed_verts_world,
+        sample_lmk3d=sample_lmk3d,
+        project_xy=project_xy,
+        dump_stage=dump_stage,
+        stage_bgr=stage_bgr,
+        gt_xy=gt_xy,
+        gt_t=gt_t,
+        width=width,
+        height=height,
+        mouth_locked=mouth_locked,
+        metric_reg=metric_reg,
+        weighted_landmark_loss=weighted_landmark_loss,
+        w_lmk=w_expr,
+        faces=faces,
+    )
+    if photo_stats:
+      last = {**last, **{k: v for k, v in photo_stats.items() if k not in ("photo_tex", "photo_all", "photo_offset")}}
+      last["photo_tex"] = photo_stats.get("photo_tex", {})
+      last["photo_all"] = photo_stats.get("photo_all", {})
+      last["photo_offset"] = photo_stats.get("photo_offset", {})
 
   elapsed = time.time() - t0
   with torch.no_grad():
@@ -1590,6 +1674,7 @@ def main() -> int:
       "mouth_locked": mouth_locked,
       "mouth_inner_gap_px": mouth_gap_px,
       "mouth_width_px": mouth_width_px,
+      "photometric": bool(args.photometric),
       **final_m,
       **last,
   }
