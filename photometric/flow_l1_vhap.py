@@ -26,9 +26,10 @@ from flow_photo import group, load_base, raster_mask
 from uvmask import tensor_mask
 
 OUT = Path("/root/autodl-tmp/gnm_fit_out/expression_v3/flow_frame0/photo_l1_vhap")
-PAINTED = Path("/root/autodl-tmp/gnm_fit_out/expression_v3/gnm_uv_from_flame_lmk68.png")
-EYE_TEX = Path("/root/autodl-tmp/gnm_fit_out/expression_v3/gnm_eye_uv.png")
-EYE_UV = Path("/root/autodl-tmp/gnm_fit_out/expression_v3/gnm_eye_uv_repacked.npz")
+_UV = Path(__file__).resolve().parent / "uv"
+PAINTED = _UV / "gnm_uv_from_flame_lmk68.png"
+EYE_TEX = _UV / "gnm_eye_uv.png"
+EYE_UV = _UV / "gnm_eye_uv_repacked.npz"
 PARAMS = Path("/root/autodl-tmp/gnm_fit_out/expression_v3/flow_frame0/frame_000000_params.npz")
 APPEAR = Path("/root/autodl-tmp/gnm_fit_out/expression_v3/flow_frame0/photo/photo_appearance.npz")
 LMK = Path("/root/autodl-tmp/gnm_fit_out/expression_v3/facepoints68.npz")

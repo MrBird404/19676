@@ -27,9 +27,10 @@ from fit_gnm import FitState, ibug68_vhap_weights
 import photo_fit
 
 OUT = Path("/root/autodl-tmp/gnm_fit_out/expression_v3/flow_frame0/photo")
-PAINTED = Path("/root/autodl-tmp/gnm_fit_out/expression_v3/gnm_uv_from_flame_lmk68.png")
-EYE_TEX = Path("/root/autodl-tmp/gnm_fit_out/expression_v3/gnm_eye_uv.png")
-EYE_UV = Path("/root/autodl-tmp/gnm_fit_out/expression_v3/gnm_eye_uv_repacked.npz")
+_UV = Path(__file__).resolve().parent / "uv"
+PAINTED = _UV / "gnm_uv_from_flame_lmk68.png"
+EYE_TEX = _UV / "gnm_eye_uv.png"
+EYE_UV = _UV / "gnm_eye_uv_repacked.npz"
 PARAMS = Path("/root/autodl-tmp/gnm_fit_out/expression_v3/flow_frame0/frame_000000_params.npz")
 LMK = Path("/root/autodl-tmp/gnm_fit_out/expression_v3/facepoints68.npz")
 LMK_FILE = Path(__file__).resolve().parents[1] / "MediaPipe_备份" / "head_sparse_68_v3_改.txt"
