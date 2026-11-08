@@ -16,6 +16,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(_ROOT / "MediaPipe_备份"))
 sys.path.insert(0, "/root/autodl-tmp/GNM-main")
+sys.path.insert(0, "/root/autodl-tmp/MediaPipe_V3")
 
 from gnm.shape import gnm_numpy, gnm_pytorch
 import gnm_mediapipe_landmarks as mp_lmk
@@ -130,7 +131,12 @@ def main() -> None:
     edges_t = edges_cpu.to(device)
     deg_t = torch.as_tensor(deg_np, dtype=torch.float32, device=device)
     neck_t = torch.as_tensor(neck_ids, dtype=torch.long, device=device)
+    face_cpu = torch.as_tensor(skin[rest[skin, 1] >= 0.18], dtype=torch.long)
     lip_t = torch.as_tensor(lip_ids, dtype=torch.long, device=device)
+    lip_pair = np.isin(edges_np, lip_ids).all(axis=1)
+    lip_e = torch.as_tensor(edges_np[lip_pair], dtype=torch.long)
+    lip_touch = np.isin(edges_np[:, 0], lip_ids) | np.isin(edges_np[:, 1], lip_ids)
+    lip_jump_e = torch.as_tensor(edges_np[lip_touch], dtype=torch.long)
     renderer = NVDiffRenderer(
         use_opengl=False, lighting_type="SH", lighting_space="world",
         disturb_rate_fg=0.0, disturb_rate_bg=0.0,
@@ -175,6 +181,13 @@ def main() -> None:
         verts = verts + gnm.compute_pose_correctives(rotations)
         verts = verts + canonical_offset()[None].to(verts.device)
         return gnm.vertex_positions_world(verts, joints, rotations, translation)[0]
+
+    def lip_bind():
+        verts = gnm.vertex_positions_bind_pose(
+            state.identity().detach()[None], state.expression().detach()[None],
+        )
+        verts = verts + gnm.compute_pose_correctives(state.rotations().detach()[None])
+        return (verts + canonical_offset()[None].to(verts.device))[0]
 
     def face_albedo():
         up = F.interpolate(res, size=(h, w), mode="bilinear", align_corners=True)[0].permute(1, 2, 0)
@@ -261,7 +274,10 @@ def main() -> None:
         reg_diffuse = torch.relu(diffuse.max() - 1.0)
         reg_abs = off.abs().mean()
         reg_lap = lap_coord(off).pow(2).sum(dim=-1).mean()
-        reg_rigid = off[neck_t].var(dim=0).mean() + off[lip_t].var(dim=0).mean()
+        lip_verts = lip_bind()
+        elen = torch.linalg.norm(lip_verts[lip_e[:, 0]] - lip_verts[lip_e[:, 1]], dim=-1)
+        lip_edge = F.relu(1.2e-3 - elen).pow(2).sum() + F.relu(elen - 4.5e-3).pow(2).sum()
+        reg_rigid = off[neck_t].var(dim=0).mean()
         # Large skin color stays. Creases may darken. New hue is limited to the lips,
         # so the nasolabial folds cannot turn green.
         k = 49
@@ -281,6 +297,7 @@ def main() -> None:
             + 10.0 * reg_diffuse
             + 3.0e2 * reg_abs
             + w_lap * reg_lap
+            + 2.0e7 * lip_edge
             + 3.0e2 * reg_rigid
             + (2.0e4 * detail).to(dev)
             + (3.0e4 * hue).to(dev)
@@ -295,11 +312,6 @@ def main() -> None:
         return loss, rgb_loss, lmk, eye, rgba
 
     opt = torch.optim.Adam([
-        {"params": [state.ex_lower], "lr": 5e-2},
-        {"params": [state.rot_neck, state.rot_head], "lr": 5e-3},
-        {"params": [state.translation], "lr": 1e-3},
-        {"params": [state.id_head], "lr": 5e-3},
-        {"params": [state.cam_aa, state.cam_t], "lr": 5e-3},
         {"params": [lights], "lr": 5e-3},
         {"params": [res], "lr": 5e-3},
         {"params": [offset], "lr": 5e-4},
@@ -373,6 +385,24 @@ def main() -> None:
         opt.step()
         with torch.no_grad():
             offset[pin_t] = 0
+            e0, e1 = lip_jump_e[:, 0], lip_jump_e[:, 1]
+            one = torch.ones(e0.shape[0], 1, dtype=offset.dtype)
+            for _ in range(40):
+                delta = offset[e0] - offset[e1]
+                dist = torch.linalg.norm(delta, dim=-1, keepdim=True).clamp(min=1e-8)
+                if float(dist.max()) <= 1.02e-3:
+                    break
+                excess = F.relu(1.0 - 1.0e-3 / dist) * delta
+                add = torch.zeros_like(offset)
+                cnt = torch.zeros(offset.shape[0], 1, dtype=offset.dtype)
+                add.index_add_(0, e0, -0.5 * excess)
+                add.index_add_(0, e1, 0.5 * excess)
+                cnt.index_add_(0, e0, one)
+                cnt.index_add_(0, e1, one)
+                offset.add_(add / cnt.clamp(min=1))
+                offset[pin_t] = 0
+            offset[face_cpu] -= offset[face_cpu].mean(0)
+            offset[pin_t] = 0
         if i == 0 or (i + 1) % 50 == 0 or i + 1 == steps:
             with torch.no_grad():
                 _, rgb_c, err_c, eye_c, rgba_c = energy(False)
@@ -393,7 +423,7 @@ def main() -> None:
                 and float(err_c[27:36].mean()) < 1.0
                 and cheek_rg > cheek_rg_ref - 0.012
                 and fold_rg > fold_rg_ref - 0.015
-                and edge_mm < 0.80
+                and edge_mm < 1.05
                 and max_mm < 4.0
             )
             if ok and score < best_score:
@@ -408,6 +438,9 @@ def main() -> None:
                 f"cheek={cheek_l.tolist()} fold={fold.tolist()} brow={brow_l.tolist()} best@{best_i}",
                 flush=True,
             )
+    if best_i == 0:
+        print("no step beat the start; previous photo_offset_detail left unchanged", flush=True)
+        return
     restore(best)
     with torch.no_grad():
         _, rgb1, err1, eye1, rgba1 = energy(False)
