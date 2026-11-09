@@ -17,8 +17,7 @@ import torch.nn.functional as F
 
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(_ROOT / "MediaPipe_备份"))
-sys.path.insert(0, "/root/autodl-tmp/MediaPipe_V3")
+sys.path.insert(0, "/root/autodl-tmp/GNM_Fit")
 sys.path.insert(0, "/root/autodl-tmp/GNM-main")
 
 from gnm.shape import gnm_numpy, gnm_pytorch
@@ -38,7 +37,7 @@ EYE_TEX = _UV / "gnm_eye_uv.png"
 EYE_UV = _UV / "gnm_eye_uv_repacked.npz"
 APPEAR = Path("/root/autodl-tmp/gnm_fit_out/expression_v3/flow_frame0/photo_contour_only/photo_appearance.npz")
 LMK = Path("/root/autodl-tmp/gnm_fit_out/expression_v3/facepoints68.npz")
-LMK_FILE = _ROOT / "MediaPipe_备份" / "head_sparse_68_v3_改.txt"
+LMK_FILE = Path("/root/autodl-tmp/GNM_Fit/head_sparse_68_v3_改.txt")
 EPOCHS = 30
 N_EYE = 12
 

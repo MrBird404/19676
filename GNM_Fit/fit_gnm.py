@@ -2,7 +2,7 @@
 """GNM v3 HEAD landmark fit — VHAP-style 3-stage + true-perspective camera.
 
 ``--lmk_set sparse68`` (default): 2D GT is iBUG 68, 3D is
-``MediaPipe/head_sparse_68_v3_改.txt``. ``dense468`` is the legacy MediaPipe path.
+``GNM_Fit/head_sparse_68_v3_改.txt``. ``dense468`` is the legacy MediaPipe path.
 
 Camera: OpenGL-like K + RT (no weak-perspective, no vertex [1,-1,-1] bake).
 World = GNM native. Projection matches ``nvdiffrast_render.camera``.
@@ -40,7 +40,7 @@ ROOT = Path(__file__).resolve().parent
 REPO = ROOT.parent / "GNM-main"
 GNM_68_FILE = REPO / "gnm" / "shape" / "data" / "landmarks" / "head_sparse_68.txt"
 GNM_68_IBUG_FILE = ROOT / "head_sparse_68_ibug_order.txt"
-V3_68_FILE = ROOT.parent / "MediaPipe" / "head_sparse_68_v3_改.txt"
+V3_68_FILE = ROOT / "head_sparse_68_v3_改.txt"
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(ROOT))
 
@@ -515,7 +515,7 @@ def main() -> int:
       choices=("star", "identity", "mp68", "mp2dlib", "mp68_ibug", "mp68_v1"),
       default="star",
       help="2D 68 GT. star/identity = already iBUG 68, paired with "
-           "MediaPipe/head_sparse_68_v3_改.txt. "
+           "GNM_Fit/head_sparse_68_v3_改.txt. "
            "mp* = subset from MediaPipe 468 (legacy).",
   )
   p.add_argument("--landmark_file", type=Path, default=None)
@@ -688,7 +688,7 @@ def main() -> int:
     if Path(args.landmark_file).resolve() == GNM_68_FILE.resolve():
       print(
           "[warn] gt68_map=mp2dlib with official GNM 68 (jaw #75). "
-          "Prefer MediaPipe/head_sparse_68_ibug_order.txt",
+          "Prefer GNM_Fit/head_sparse_68_ibug_order.txt",
           flush=True,
       )
   if args.expr_brow_weight is None:

@@ -13,7 +13,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-FACEPOINTS_ROOT = Path("/root/autodl-tmp/facepoints")
+FACEPOINTS_ROOT = Path("/root/autodl-tmp/detectors/facepoints")
 sys.path.insert(0, str(FACEPOINTS_ROOT.parent))
 from facepoints import Detector, square_box  # noqa: E402
 

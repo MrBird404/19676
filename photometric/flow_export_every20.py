@@ -13,9 +13,8 @@ import torch
 import torch.nn.functional as F
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(_ROOT / "MediaPipe_备份"))
 sys.path.insert(0, "/root/autodl-tmp/GNM-main")
-sys.path.insert(0, "/root/autodl-tmp/MediaPipe_V3")
+sys.path.insert(0, "/root/autodl-tmp/GNM_Fit")
 
 from gnm.shape import gnm_numpy, gnm_pytorch
 import gnm_mediapipe_landmarks as mp_lmk
@@ -33,7 +32,7 @@ PAINTED = _UV / "gnm_uv_from_flame_lmk68.png"
 EYE_TEX = _UV / "gnm_eye_uv.png"
 EYE_UV = _UV / "gnm_eye_uv_repacked.npz"
 LMK = Path("/root/autodl-tmp/gnm_fit_out/expression_v3/facepoints68.npz")
-LMK_FILE = _ROOT / "MediaPipe_备份" / "head_sparse_68_v3_改.txt"
+LMK_FILE = Path("/root/autodl-tmp/GNM_Fit/head_sparse_68_v3_改.txt")
 N_EYE = 12
 
 

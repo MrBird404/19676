@@ -2,7 +2,7 @@
 
 单目流程。逐步说明见 [流程.md](流程.md)。第 0 帧的偏移 mesh 在 [mesh/frame_0000.obj](mesh/frame_0000.obj)。原先采用的第 0 帧仍是 `photo_contour_only`，跟踪结果在 `track_global/`。
 
-1. `MediaPipe_备份/fit_gnm.py`：刚体和形状，预设 `vhap_monocular`，3D 锚点 `head_sparse_68_v3_改.txt`。刚体各点权重一样。形状阶段鼻子 27–36 权重 10，下颌 0–16 权重 1。
+1. `GNM_Fit/fit_gnm.py`：刚体和形状，预设 `vhap_monocular`，3D 锚点 `head_sparse_68_v3_改.txt`。刚体各点权重一样。形状阶段鼻子 27–36 权重 10，下颌 0–16 权重 1。
 2. `photometric/flow_photo.py`：眼球只旋转，不平移。
 3. `photometric/flow_l1_vhap.py`：光度第一层，VHAP `rgb_init_texture`。输出 `photo_l1_vhap/`。
 4. `photometric/flow_l2_vhap.py`：光度第二层。残差锁在第一层，脸颊保持暖色。输出 `photo_l2_hue/`。

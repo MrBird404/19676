@@ -66,7 +66,7 @@ def main() -> int:
   p.add_argument(
       "--model",
       type=Path,
-      default=Path(__file__).with_name("models") / "face_landmarker.task",
+      default=Path(__file__).resolve().parent.parent / "detectors" / "mediapipe" / "face_landmarker.task",
   )
   p.add_argument("--max_frames", type=int, default=1)
   p.add_argument("--stride", type=int, default=1)

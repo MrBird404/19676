@@ -19,6 +19,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parent
 REPO_ROOT = ROOT.parent
+# 代码在 VHAP 自带的 STAR；权重在 detectors/STAR/checkpoints（vendor 里是软链）。
 STAR_ROOT = REPO_ROOT / "VHAP-main" / "vendor" / "STAR-master"
 CKPT = STAR_ROOT / "checkpoints" / "300W_STARLoss_NME_2_87.pkl"
 DLIB_DAT = STAR_ROOT / "checkpoints" / "shape_predictor_68_face_landmarks.dat"
