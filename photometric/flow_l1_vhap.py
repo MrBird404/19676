@@ -1,7 +1,8 @@
-"""Photometric layer 1, VHAP rgb_init_texture set.
+"""Photometric layer 1, VHAP rgb_init_texture.
 
-Camera, shape, texture and lights move. Pose, expression, eye joints and
-offsets stay fixed. The residual still cannot change brightness.
+Camera, shape, texture and lights move. Pose, expression and the eyeball
+stay fixed. The residual is smoothed by total variation so it separates
+skin, lips and brows instead of painting fine detail. Eye color can move.
 """
 import sys
 from pathlib import Path
@@ -15,6 +16,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(_ROOT / "MediaPipe_备份"))
 sys.path.insert(0, "/root/autodl-tmp/GNM-main")
+sys.path.insert(0, "/root/autodl-tmp/MediaPipe_V3")
 
 from gnm.shape import gnm_numpy, gnm_pytorch
 import gnm_mediapipe_landmarks as mp_lmk
@@ -135,7 +137,6 @@ def main() -> None:
 
     def face_albedo():
         up = F.interpolate(res, size=(h, w), mode="bilinear", align_corners=True)[0].permute(1, 2, 0)
-        up = up - up.mean(dim=-1, keepdim=True)
         return (base_face + up * face_keep_t[..., None]).clamp(1e-4, 1.0 - 1e-4)
 
     def eye_albedo():
@@ -200,7 +201,6 @@ def main() -> None:
         eye = (project(verts[uv_center_t]) - target_t).abs().mean()
         tv = (res[:, :, :-1, :] - res[:, :, 1:, :]).pow(2).mean()
         tv = tv + (res[:, :, :, :-1] - res[:, :, :, 1:]).pow(2).mean()
-        luma = res.mean(dim=1).pow(2).mean()
         reg_diffuse = torch.relu(diffuse.max() - 1.0)
         dev = rgb_loss.device
         loss = (
@@ -208,8 +208,7 @@ def main() -> None:
             + 10.0 * lmk_w.to(dev)
             + 10.0 * eye.to(dev)
             + 10.0 * reg_diffuse
-            + 2.0e3 * tv
-            + 40.0 * luma
+            + 1.0e4 * tv
             + 0.002 * (lights[:, 1:] ** 2).mean()
             + 0.02 * eye_col.pow(2).mean()
             + (0.3 * state.id_head.pow(2).mean()).to(dev)
@@ -265,8 +264,6 @@ def main() -> None:
         opt.zero_grad()
         loss, _, _, _, _ = energy(True)
         loss.backward()
-        if res.grad is not None:
-            res.grad = res.grad - res.grad.mean(dim=1, keepdim=True)
         torch.nn.utils.clip_grad_norm_([state.id_head, state.cam_aa, state.cam_t], 0.5)
         torch.nn.utils.clip_grad_norm_([res], 4.0)
         torch.nn.utils.clip_grad_norm_([lights, eye_col], 1.0)

@@ -1,9 +1,9 @@
-"""Photometric layer 2, VHAP rgb_init_all set.
+"""Photometric layer 2, VHAP rgb_init_all.
 
-Head and neck pose and expression join the layer-1 parameters. Eye joints
-stay fixed. Jaw landmarks stay off. No vertex offset. Residual brightness
-stays penalized. Residual and light hue stay near the layer-1 result so
-the cheeks cannot shift cyan or red.
+Pose and expression join the layer-1 parameters. The same texture map keeps
+moving under the same total variation, so this stage still has color to
+learn. The eyeball mesh stays at the SAM3 pose. Eye color can move. Jaw
+landmarks stay off. No vertex offset.
 """
 import sys
 from pathlib import Path
@@ -17,6 +17,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(_ROOT / "MediaPipe_备份"))
 sys.path.insert(0, "/root/autodl-tmp/GNM-main")
+sys.path.insert(0, "/root/autodl-tmp/MediaPipe_V3")
 
 from gnm.shape import gnm_numpy, gnm_pytorch
 import gnm_mediapipe_landmarks as mp_lmk
@@ -204,14 +205,6 @@ def main() -> None:
         eye = (project(verts[uv_center_t]) - target_t).abs().mean()
         tv = (res[:, :, :-1, :] - res[:, :, 1:, :]).pow(2).mean()
         tv = tv + (res[:, :, :, :-1] - res[:, :, :, 1:]).pow(2).mean()
-        luma = res.mean(dim=1).pow(2).mean()
-        bias = res.mean(dim=(2, 3))
-        # Adding gray on top of the warm base desaturates the cheeks. Hold the
-        # whole residual on the layer-1 map, and keep new light color out.
-        res_lock = (res - res_ref).pow(2).mean()
-        light_hue = (lights - lights.mean(dim=-1, keepdim=True)) - (
-            lights_ref - lights_ref.mean(dim=-1, keepdim=True)
-        )
         reg_diffuse = torch.relu(diffuse.max() - 1.0)
         dev = rgb_loss.device
         loss = (
@@ -219,11 +212,7 @@ def main() -> None:
             + 10.0 * lmk_w.to(dev)
             + 10.0 * eye.to(dev)
             + 10.0 * reg_diffuse
-            + 2.0e3 * tv
-            + 40.0 * luma
-            + 5.0e3 * bias.pow(2).mean()
-            + 5.0e4 * res_lock
-            + 2.0e3 * light_hue.pow(2).mean()
+            + 1.0e4 * tv
             + 0.002 * (lights[:, 1:] ** 2).mean()
             + 0.02 * eye_col.pow(2).mean()
             + (0.3 * (state.id_head - id_ref).pow(2).mean()).to(dev)

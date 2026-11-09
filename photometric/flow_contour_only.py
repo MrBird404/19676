@@ -16,6 +16,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(_ROOT / "MediaPipe_备份"))
 sys.path.insert(0, "/root/autodl-tmp/GNM-main")
+sys.path.insert(0, "/root/autodl-tmp/MediaPipe_V3")
 
 from gnm.shape import gnm_numpy, gnm_pytorch
 from nvdiffrast_render import NVDiffRenderer

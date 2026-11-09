@@ -72,7 +72,7 @@ def main() -> None:
         id_head=p(saved["id_head"]), id_eyes=p(saved["id_eyes"]),
         ex_lower=p(saved["expression_lower_face"], True),
         rot_neck=p(rot0[0], True), rot_head=p(rot0[1], True),
-        rot_leye=p(rot0[2], True), rot_reye=p(rot0[3], True),
+        rot_leye=p(rot0[2]), rot_reye=p(rot0[3]),
         translation=p(saved["translation"], True),
         cam_aa=p(saved["cam_aa"]), cam_t=p(saved["cam_t"]),
         focal_norm=p(saved["focal_norm"]),
@@ -248,7 +248,6 @@ def main() -> None:
     opt = torch.optim.Adam([
         {"params": [state.ex_lower], "lr": 1e-2},
         {"params": [state.rot_neck, state.rot_head], "lr": 5e-3},
-        {"params": [state.rot_leye, state.rot_reye], "lr": 5e-3},
         {"params": [state.translation], "lr": 1e-3},
     ])
     for g in opt.param_groups:
@@ -282,7 +281,7 @@ def main() -> None:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_([
                     state.ex_lower, state.rot_neck, state.rot_head,
-                    state.rot_leye, state.rot_reye, state.translation,
+                    state.translation,
                 ], 0.5)
                 opt.step()
                 if i == 0 or i == STEPS - 1 or (i + 1) % 10 == 0:

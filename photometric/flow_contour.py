@@ -16,6 +16,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(_ROOT / "MediaPipe_备份"))
 sys.path.insert(0, "/root/autodl-tmp/GNM-main")
+sys.path.insert(0, "/root/autodl-tmp/MediaPipe_V3")
 
 from gnm.shape import gnm_numpy, gnm_pytorch
 import gnm_mediapipe_landmarks as mp_lmk
@@ -162,9 +163,7 @@ def main() -> None:
     w_lmk[:17] = 1.0
     w_lmk_t = torch.as_tensor(w_lmk, dtype=torch.float32)
     gt_lmk = torch.as_tensor(gt_xy, dtype=torch.float32)
-    contour = np.load(
-        "/root/autodl-tmp/gnm_fit_out/expression_v3/flow_frame0/photo_jaw_edge/face_sam/face_mask.npz"
-    )["lower_contour_smooth"]
+    contour = np.load(Path(__file__).resolve().parent / "face_mask.npz")["lower_contour_smooth"]
     xs = np.arange(pw, dtype=np.float32)
     order = np.argsort(contour[:, 0])
     jaw_y = np.interp(xs, contour[order, 0].astype(np.float32), contour[order, 1].astype(np.float32))

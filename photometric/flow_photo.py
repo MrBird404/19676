@@ -18,6 +18,7 @@ sys.path.insert(0, str(_ROOT / "MediaPipe_备份"))
 sys.path.insert(0, "/root/autodl-tmp/GNM-main")
 sys.path.insert(0, "/root/autodl-tmp/sam3-main")
 sys.path.insert(0, "/root/autodl-tmp/colmap_video_jamin_static")
+sys.path.insert(0, "/root/autodl-tmp/MediaPipe_V3")
 
 from gnm.shape import gnm_numpy, gnm_pytorch
 import gnm_mediapipe_landmarks as mp_lmk
@@ -533,16 +534,15 @@ def main() -> None:
 
     report_lmk("before-joint")
     joint_params = [
-        state.id_head, state.id_eyes, state.ex_lower,
-        state.rot_neck, state.rot_head, state.rot_leye, state.rot_reye,
+        state.id_head, state.ex_lower,
+        state.rot_neck, state.rot_head,
         state.translation, state.cam_aa, state.cam_t,
         colors, lights, eye_col,
     ]
     joint_opt = torch.optim.Adam([
-        {"params": [state.id_head, state.id_eyes], "lr": 1e-3},
+        {"params": [state.id_head], "lr": 1e-3},
         {"params": [state.ex_lower], "lr": 5e-3},
         {"params": [state.rot_neck, state.rot_head], "lr": 1e-3},
-        {"params": [state.rot_leye, state.rot_reye], "lr": 5e-4},
         {"params": [state.translation, state.cam_t], "lr": 2e-4},
         {"params": [state.cam_aa], "lr": 5e-4},
         {"params": [colors], "lr": 5e-3},

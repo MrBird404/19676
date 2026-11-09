@@ -79,9 +79,11 @@ def main() -> None:
     rot_head = sequence(prior["rot_head"])
     rot_leye = sequence(prior["rot_leye"])
     rot_reye = sequence(prior["rot_reye"])
+    rot_leye.requires_grad_(False)
+    rot_reye.requires_grad_(False)
     translation = sequence(prior["translation"])
     state = FitState(
-        id_head=leaf(prior["id_head"]), id_eyes=leaf(prior["id_eyes"]),
+        id_head=leaf(prior["id_head"]), id_eyes=torch.tensor(np.asarray(prior["id_eyes"]), dtype=torch.float32),
         ex_lower=ex_lower[0],
         rot_neck=rot_neck[0], rot_head=rot_head[0],
         rot_leye=rot_leye[0], rot_reye=rot_reye[0],
@@ -94,7 +96,7 @@ def main() -> None:
     offset0 = static_off.detach().clone()
     res = leaf(prior["residual"])
     lights = leaf(prior["lights"])
-    eye_col = torch.tensor(np.asarray(prior["eye_col"]), dtype=torch.float32)
+    eye_col = leaf(prior["eye_col"])
     named = {
         "ex_lower": ex_lower, "ex_leye": ex_leye, "ex_reye": ex_reye,
         "rot_neck": rot_neck, "rot_head": rot_head,
@@ -251,7 +253,7 @@ def main() -> None:
         return out["rgba"], depth, fid
 
     def render():
-        eye_out, eye_z, _ = raster(eye_ids, eye_tri_uv, eye_tex)
+        eye_out, eye_z, _ = raster(eye_ids, eye_tri_uv, albedo_eye())
         face_out, face_z, face_fid = raster(face_ids, tri_uv[face_ids], albedo_face())
         eye_on = eye_out[..., 3:] > 0.5
         face_on = face_out[..., 3:] > 0.5
@@ -337,12 +339,9 @@ def main() -> None:
             + pair(state.ex_lower, ex_lower, t)
             + 0.05 * pair(cur["leye"], ex_leye, t)
             + 0.05 * pair(cur["reye"], ex_reye, t)
-            + pair(state.rot_leye, rot_leye, t)
-            + pair(state.rot_reye, rot_reye, t)
         )
         clash = lid_clash(bind_verts())
-        gaze = visible_pupil(rgba, pupil)
-        gaze_px["v"] = float(gaze.detach())
+        gaze_px["v"] = 0.0
         delta = static_off - offset0
         reg = (
             0.3 * state.id_head.pow(2).mean()
@@ -359,7 +358,6 @@ def main() -> None:
             30.0 * rgb_loss
             + 10.0 * lmk_w.to(dev)
             + 4.0 * open_err.to(dev)
-            + 40.0 * gaze.to(dev)
             + 2.0e7 * clash.to(dev)
             + smooth.to(dev)
             + reg.to(dev)
@@ -398,11 +396,9 @@ def main() -> None:
 
     opt = torch.optim.Adam([
         {"params": [ex_lower, ex_leye, ex_reye], "lr": 5.0e-3},
-        {"params": [
-            rot_neck, rot_head, rot_leye, rot_reye, state.id_head, state.id_eyes,
-        ], "lr": 5.0e-4},
+        {"params": [rot_neck, rot_head, state.id_head], "lr": 5.0e-4},
         {"params": [translation], "lr": 1.0e-4},
-        {"params": [state.cam_aa, state.cam_t, state.focal_norm, lights, res], "lr": 5.0e-4},
+        {"params": [state.cam_aa, state.cam_t, state.focal_norm, lights, res, eye_col], "lr": 5.0e-4},
     ])
     sched = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=0.9)
     order = np.arange(n_frames)
@@ -439,10 +435,10 @@ def main() -> None:
                     worst = (lmk_v, t)
             torch.nn.utils.clip_grad_norm_([
                 ex_lower, ex_leye, ex_reye, rot_neck, rot_head, translation,
-                state.id_head, state.id_eyes, state.cam_aa, state.cam_t,
+                state.id_head, state.cam_aa, state.cam_t,
                 state.focal_norm, lights, res,
             ], 0.5)
-            torch.nn.utils.clip_grad_norm_([rot_leye, rot_reye], 1.0)
+            torch.nn.utils.clip_grad_norm_([eye_col], 1.0)
             opt.step()
             with torch.no_grad():
                 static_off[eye_pin] = offset0[eye_pin]

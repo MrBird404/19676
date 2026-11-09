@@ -74,7 +74,7 @@ def main() -> None:
         id_head=p(saved["id_head"]), id_eyes=p(saved["id_eyes"]),
         ex_lower=p(saved["expression_lower_face"], True),
         rot_neck=p(rot0[0], True), rot_head=p(rot0[1], True),
-        rot_leye=p(rot0[2], True), rot_reye=p(rot0[3], True),
+        rot_leye=p(rot0[2]), rot_reye=p(rot0[3]),
         translation=p(saved["translation"], True),
         cam_aa=p(saved["cam_aa"]), cam_t=p(saved["cam_t"]),
         focal_norm=p(saved["focal_norm"]),
@@ -304,15 +304,11 @@ def main() -> None:
             + 0.05 * (ex_reye - prev["ex_reye"]).pow(2).mean()
         )
         clash = lid_clash(bind_verts())
-        gaze = visible_pupil(rgba, pupil_t)
-        gaze_px["v"] = float(gaze.detach())
-        smooth = smooth + (state.rot_leye - prev["rot_leye"]).pow(2).mean()
-        smooth = smooth + (state.rot_reye - prev["rot_reye"]).pow(2).mean()
+        gaze_px["v"] = 0.0
         loss = (
             30.0 * rgb_loss
             + 10.0 * lmk_w.to(dev)
             + 4.0 * open_err.to(dev)
-            + 40.0 * gaze.to(dev)
             + 2.0e7 * clash.to(dev)
             + smooth.to(dev)
         )
@@ -380,7 +376,6 @@ def main() -> None:
         {"params": [state.ex_lower], "lr": 1e-2},
         {"params": [ex_leye, ex_reye], "lr": 5e-2},
         {"params": [state.rot_neck, state.rot_head], "lr": 5e-3},
-        {"params": [state.rot_leye, state.rot_reye], "lr": 2e-2},
         {"params": [state.translation], "lr": 1e-3},
     ])
     for g in opt.param_groups:
@@ -425,7 +420,6 @@ def main() -> None:
                     state.ex_lower, ex_leye, ex_reye, state.rot_neck, state.rot_head,
                     state.translation,
                 ], 0.5)
-                torch.nn.utils.clip_grad_norm_([state.rot_leye, state.rot_reye], 1.0)
                 opt.step()
                 if i == 0 or i == STEPS - 1 or (i + 1) % 10 == 0:
                     with torch.no_grad():
