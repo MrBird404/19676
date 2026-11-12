@@ -605,9 +605,19 @@ def _build_and_run(args) -> int:
     return torch.tensor(np.asarray(v), dtype=torch.float32).requires_grad_(True)
 
   rot = np.asarray(params["rotations"], dtype=np.float32)
+  if "expression_left_eye" in params.files:
+    ex_left = np.asarray(params["expression_left_eye"], dtype=np.float32)
+  else:
+    ex_left = np.zeros(100, dtype=np.float32)
+  if "expression_right_eye" in params.files:
+    ex_right = np.asarray(params["expression_right_eye"], dtype=np.float32)
+  else:
+    ex_right = np.zeros(100, dtype=np.float32)
   state = FitState(
       id_head=p(params["id_head"]),
       id_eyes=p(params["id_eyes"]),
+      ex_left=p(ex_left),
+      ex_right=p(ex_right),
       ex_lower=p(params["expression_lower_face"]),
       rot_neck=p(rot[0]),
       rot_head=p(rot[1]),

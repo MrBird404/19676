@@ -37,7 +37,7 @@ import torch
 import trimesh
 
 ROOT = Path(__file__).resolve().parent
-REPO = ROOT.parent / "GNM-main"
+REPO = next(p for p in [ROOT, *ROOT.parents] if (p / "GNM-main").is_dir()) / "GNM-main"
 GNM_68_FILE = REPO / "gnm" / "shape" / "data" / "landmarks" / "head_sparse_68.txt"
 GNM_68_IBUG_FILE = ROOT / "head_sparse_68_ibug_order.txt"
 V3_68_FILE = ROOT / "head_sparse_68_v3_改.txt"
@@ -249,6 +249,8 @@ def ibug68_stage_weights(
 class FitState:
   id_head: torch.Tensor
   id_eyes: torch.Tensor
+  ex_left: torch.Tensor
+  ex_right: torch.Tensor
   ex_lower: torch.Tensor
   rot_neck: torch.Tensor
   rot_head: torch.Tensor
@@ -276,6 +278,8 @@ class FitState:
     return cls(
         id_head=p(None, 170),
         id_eyes=p(None, 3),
+        ex_left=p(None, 100),
+        ex_right=p(None, 100),
         ex_lower=p(None, 150),
         rot_neck=p(None, 3),
         rot_head=p(None, 3),
@@ -296,10 +300,24 @@ class FitState:
   expr_w: torch.Tensor | None = None
 
   def expression(self) -> torch.Tensor:
-    ex = self.expr_dirs @ self.expr_w if self.expr_dirs is not None else self.ex_lower
+    # 383 = left_eye 100 + right_eye 100 + lower_face 150 + tongue 32 + pupils 1.
+    # expr_dirs (350, K): face PCA, c_face = dirs @ w.
+    # expr_dirs (150, K): safe_expr mouth directions in lower-face only.
+    if self.expr_dirs is not None:
+      mapped = self.expr_dirs @ self.expr_w
+      if mapped.shape[0] == 350:
+        left, right, ex = mapped[:100], mapped[100:200], mapped[200:350]
+      else:
+        ex = mapped
+        left = torch.zeros(100, dtype=ex.dtype, device=ex.device)
+        right = torch.zeros(100, dtype=ex.dtype, device=ex.device)
+    else:
+      ex = self.ex_lower
+      left = self.ex_left
+      right = self.ex_right
     return torch.cat([
-        torch.zeros(100, dtype=ex.dtype, device=ex.device),
-        torch.zeros(100, dtype=ex.dtype, device=ex.device),
+        left,
+        right,
         ex,
         torch.zeros(32, dtype=ex.dtype, device=ex.device),
         torch.zeros(1, dtype=ex.dtype, device=ex.device),
@@ -325,8 +343,9 @@ class FitState:
 
   def snapshot(self) -> dict[str, torch.Tensor]:
     fields = (
-        "id_head", "id_eyes", "ex_lower", "rot_neck", "rot_head",
-        "rot_leye", "rot_reye", "translation", "cam_aa", "cam_t", "focal_norm",
+        "id_head", "id_eyes", "ex_left", "ex_right", "ex_lower",
+        "rot_neck", "rot_head", "rot_leye", "rot_reye", "translation",
+        "cam_aa", "cam_t", "focal_norm",
     )
     snap = {k: getattr(self, k).detach().clone() for k in fields}
     if self.expr_w is not None:
@@ -599,14 +618,14 @@ def main() -> int:
   p.add_argument(
       "--photometric",
       action="store_true",
-      help="After landmarks: texture+SH, then color pulls shape, then static offset. No mask contour.",
+      help="After landmarks: VHAP rgb_init_texture, rgb_init_all, rgb_init_offset. No silhouette.",
   )
   p.add_argument("--mask", type=Path, default=None, help="Unused. Masks are for compositing, not a loss.")
   p.add_argument("--photo_max_side", type=int, default=1024)
-  p.add_argument("--photo_tex_res", type=int, default=256)
-  p.add_argument("--photo_tex_iters", type=int, default=400)
-  p.add_argument("--photo_iters", type=int, default=400)
-  p.add_argument("--photo_offset_iters", type=int, default=250)
+  p.add_argument("--photo_tex_res", type=int, default=1024)
+  p.add_argument("--photo_tex_iters", type=int, default=500)
+  p.add_argument("--photo_iters", type=int, default=500)
+  p.add_argument("--photo_offset_iters", type=int, default=500)
   p.add_argument("--photo_mask_iters", type=int, default=0, help="Ignored. Silhouette stage is not used.")
   p.add_argument("--reg_id", type=float, default=0.05)
   p.add_argument("--reg_ex", type=float, default=0.03)
@@ -636,11 +655,21 @@ def main() -> int:
       default=True,
       help="After fit: nvdiffrast true-perspective mesh at video size + red 3D lmks.",
   )
+  p.add_argument(
+      "--expr_pca_dim",
+      type=int,
+      default=0,
+      help="If >0 with vhap_monocular: PCA the 350 face expression bases down to this "
+           "many coeffs (FLAME-like). 0 = optimize all left/right/lower dims.",
+  )
   args = p.parse_args()
   if args.preset == "vhap_monocular":
     # Align with VHAP-main output/.../config.yml LossWeightConfig + LearningRateConfig
     # for landmark-only stages (lmk_init_rigid / lmk_init_all style).
+    # Expression: face PCA (--expr_pca_dim, default 150) or full left/right/lower.
     args.version_name = "vhap_monocular_lmk"
+    if args.expr_pca_dim <= 0:
+      args.expr_pca_dim = 150
     args.w_landmark = 10.0
     args.nose_weight = 10.0
     args.shape_mouth_weight = 1.0
@@ -667,11 +696,14 @@ def main() -> int:
     args.lr_ex = 5e-2
     args.rigid_iters = 500
     args.shape_iters = 500
-    args.expr_iters = 500
+    # VHAP stops after lmk_init_all. The extra expression stage is not part of that.
+    args.expr_iters = 0
+    args.grad_clip = 0.0
     print(
         "[preset=vhap_monocular] balanced lmk (mouth×1 nose×10)  "
         f"reg_id={args.reg_id} reg_ex={args.reg_ex} reg_jaw_yz={args.reg_jaw_yz}  "
-        f"lr_ex={args.lr_ex} freeze_id={args.freeze_identity_in_expr}",
+        f"lr_ex={args.lr_ex} freeze_id={args.freeze_identity_in_expr}  "
+        f"expr_pca_dim={args.expr_pca_dim}",
         flush=True,
     )
   if args.landmark_file is None:
@@ -803,9 +835,12 @@ def main() -> int:
       variant=gnm_numpy.GNMVariant.HEAD,
   )
   id_scale = torch.as_tensor(gnm_utils.scaling_for_identity_loss(gnm_np), dtype=torch.float32)
+  ex_scale_full = gnm_utils.scaling_for_expression_loss(gnm_np)
   ex_scale_lower = torch.as_tensor(
-      gnm_utils.scaling_for_expression_loss(gnm_np)[200:350, 200:350], dtype=torch.float32
+      ex_scale_full[200:350, 200:350], dtype=torch.float32
   )
+  # left_eye + right_eye + lower_face (tongue/pupils stay 0).
+  ex_scale_face = torch.as_tensor(ex_scale_full[:350, :350], dtype=torch.float32)
   faces = np.asarray(gnm.triangles.detach().cpu().numpy())
 
   lmk_idx, lmk_w = mp_lmk.load_landmarks(args.landmark_file)
@@ -814,6 +849,34 @@ def main() -> int:
         f"landmark_file has {len(lmk_idx)} points but GT {args.lmk_set} has {n_lmk}"
     )
   state = FitState.from_init(init)
+  if args.preset == "vhap_monocular" and args.expr_pca_dim > 0:
+    # SVD of the 350 face bases in vertex space. Coeffs live in the top-K
+    # right-singular subspace: c_face = Vt[:K].T @ w, same span truncation as FLAME.
+    face_basis = np.asarray(gnm_np.expression_basis[:350], dtype=np.float64)
+    m_mat = face_basis.reshape(350, -1).T  # (V*3, 350)
+    _u, s_vals, vt = np.linalg.svd(m_mat, full_matrices=False)
+    k_pca = min(int(args.expr_pca_dim), 350)
+    energy = (s_vals[:k_pca] ** 2).sum() / (s_vals ** 2).sum()
+    pca_dirs = vt[:k_pca].T.astype(np.float32)  # (350, K)
+    state.expr_dirs = torch.as_tensor(pca_dirs)
+    state.expr_w = torch.zeros(k_pca, dtype=torch.float32, requires_grad=True)
+    state.ex_left.requires_grad_(False)
+    state.ex_right.requires_grad_(False)
+    state.ex_lower.requires_grad_(False)
+    pca_path = args.out_dir / f"gnm_face_expr_pca{k_pca}.npz"
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        pca_path,
+        dirs=pca_dirs,
+        singular_values=s_vals.astype(np.float32),
+        energy_covered=np.float32(energy),
+        k=np.int32(k_pca),
+    )
+    print(
+        f"[expr_pca] face 350 -> {k_pca}  energy={100.0 * energy:.1f}%  "
+        f"reg on w like FLAME  wrote {pca_path.name}",
+        flush=True,
+    )
   if args.focal_norm is not None:
     with torch.no_grad():
       state.focal_norm.fill_(float(args.focal_norm))
@@ -1029,6 +1092,14 @@ def main() -> int:
   dump_stage("0_init", "init", stage_bgr)
 
   def weighted_landmark_loss(pred_xy: torch.Tensor, conf: torch.Tensor) -> torch.Tensor:
+    if args.preset == "vhap_monocular":
+      # VHAP normalize_image_points: pixels -> [-1, 1], then L1, then mean.
+      # Nose boost stays inside the mean, so it is not diluted by sum(conf).
+      scale = pred_xy.new_tensor([float(width), float(height)])
+      pred_n = 2.0 * (pred_xy - scale * 0.5) / scale
+      gt_n = 2.0 * (gt_t - scale * 0.5) / scale
+      per = (pred_n - gt_n).abs().sum(dim=-1)
+      return (per * conf).mean()
     err = torch.linalg.norm(gt_t - pred_xy, dim=-1)
     if args.landmark_loss == "huber":
       d = args.huber_delta
@@ -1059,15 +1130,30 @@ def main() -> int:
     if reg_ex:
       if state.expr_w is not None:
         reg = reg + args.reg_ex * (state.expr_w ** 2).mean()
+      elif args.preset == "vhap_monocular":
+        ex_face = torch.cat([state.ex_left, state.ex_right, state.ex_lower], dim=0)
+        scaled_ex = ex_scale_face @ ex_face
+        reg = reg + args.reg_ex * (scaled_ex ** 2).mean()
       else:
         scaled_ex = ex_scale_lower @ state.ex_lower
         reg = reg + args.reg_ex * (scaled_ex ** 2).mean()
-    if reg_joints:
+    if reg_joints and args.preset == "vhap_monocular":
+      # VHAP compute_joint_L2_energy: reg_neck/reg_jaw 0.3, reg_eyes 0.03.
+      # Jaw y/z is multiplied by reg_jaw again, and negative jaw-x is penalized.
+      reg = reg + args.reg_joint * (state.rot_neck ** 2).mean()
+      jaw = state.rot_head
+      jaw_term = (jaw ** 2).mean() + torch.relu(-jaw[0]) * 10.0
+      jaw_term = jaw_term + (jaw[1:] ** 2).mean() * args.reg_jaw_yz
+      reg = reg + args.reg_joint * jaw_term
+      reg = reg + 0.03 * (state.rot_leye ** 2).mean()
+      reg = reg + 0.03 * (state.rot_reye ** 2).mean()
+      reg = reg + 0.03 * ((state.rot_leye - state.rot_reye) ** 2).mean()
+    elif reg_joints:
       for t in (state.rot_neck, state.rot_head, state.rot_leye, state.rot_reye, state.cam_aa):
         reg = reg + args.reg_joint * (t ** 2).mean()
       reg = reg + args.reg_joint * 0.1 * (state.cam_t ** 2).mean()
       reg = reg + args.reg_joint * 0.01 * ((state.focal_norm - 1.5) ** 2)
-    if args.reg_jaw_yz > 0:
+    if args.reg_jaw_yz > 0 and args.preset != "vhap_monocular":
       # VHAP: penalize jaw/head rotation about y/z to reduce mouth twist.
       reg = reg + args.reg_jaw_yz * (state.rot_head[1:] ** 2).mean()
     return reg
@@ -1094,10 +1180,12 @@ def main() -> int:
     best_score = float("inf")
     best = state.snapshot()
     best_m: dict = {}
-    print(f"\n==> {name}  iters={iters}", flush=True)
+    # VHAP keeps a constant Adam step and the last iterate.
+    vhap_solver = args.preset == "vhap_monocular"
+    print(f"\n==> {name}  iters={iters}  cosine={not vhap_solver}", flush=True)
     for i in range(iters):
       t = i / max(iters - 1, 1)
-      lr_scale = 0.1 + 0.9 * (0.5 * (1.0 + np.cos(np.pi * t)))
+      lr_scale = 1.0 if vhap_solver else 0.1 + 0.9 * (0.5 * (1.0 + np.cos(np.pi * t)))
       for g, base in zip(opt.param_groups, base_lrs):
         g["lr"] = base * lr_scale
       opt.zero_grad()
@@ -1195,7 +1283,14 @@ def main() -> int:
             f"best={best_score:.2f}@{best_m.get('best_iter', 0)}",
             flush=True,
         )
-    state.restore(best)
+    if not vhap_solver:
+      state.restore(best)
+    else:
+      with torch.no_grad():
+        pred_last = project_xy(sample_lmk3d(posed_verts_world()))
+      best_m = dict(metrics(pred_last))
+      best_m["best_iter"] = iters
+      best_m["score"] = best_m.get("rmse_all", 0.0)
     print(
         f"  [{name}] best @{best_m.get('best_iter')}  "
         f"all={best_m.get('rmse_all', 0):.2f} brow={best_m.get('rmse_brows', 0):.2f} "
@@ -1215,12 +1310,14 @@ def main() -> int:
   # Stage1: camera + head rigid body. Neck is the GNM root, so it is the
   # rigid rotation. Jaw (rot_head) and eyes stay at zero — they change the face.
   if args.preset == "vhap_monocular":
+    # VHAP fixes the camera RT and only solves focal length.
+    # The head rigid body is root rotation (GNM neck) plus translation.
+    state.cam_aa.requires_grad_(False)
+    state.cam_t.requires_grad_(False)
     rigid_groups = [
         {"params": [state.rot_neck], "lr": args.lr_pose},
-        {"params": [state.cam_aa], "lr": args.lr_pose},
-        {"params": [state.cam_t], "lr": args.lr_cam},
-        {"params": [state.focal_norm], "lr": args.lr_cam * 0.2},
-        {"params": [state.translation], "lr": args.lr_pose * 0.2},
+        {"params": [state.focal_norm], "lr": args.lr_cam},
+        {"params": [state.translation], "lr": 1e-3},
     ]
   else:
     rigid_groups = [
@@ -1283,15 +1380,31 @@ def main() -> int:
   # Stage2: identity, joints, expression, and pose together. Landmark only.
   # safe_expr 的身份已经在上面单独跑过。
   if args.stop_after != "rigid" and args.preset != "safe_expr":
-    shape_groups = [
-        {"params": [state.id_head, state.id_eyes], "lr": args.lr_id},
-        {"params": [state.rot_leye, state.rot_reye], "lr": args.lr_pose},
-        {"params": [state.rot_neck, state.rot_head], "lr": args.lr_pose * 0.5},
-        {"params": [state.cam_aa], "lr": args.lr_pose * 0.3},
-        {"params": [state.cam_t, state.focal_norm], "lr": args.lr_cam * 0.2},
-        {"params": [state.translation], "lr": args.lr_pose * 0.15},
-    ]
-    if shape_mouth > 0 or args.preset == "vhap_monocular":
+    if args.preset == "vhap_monocular":
+      # VHAP-like: one low-dim face expression (PCA) or full regional dims.
+      if state.expr_w is not None and state.expr_dirs is not None and state.expr_dirs.shape[0] == 350:
+        ex_params = [state.expr_w]
+      else:
+        ex_params = [state.ex_left, state.ex_right, state.ex_lower]
+      shape_groups = [
+          {"params": [state.id_head, state.id_eyes], "lr": args.lr_id},
+          {"params": ex_params, "lr": args.lr_ex},
+          {"params": [state.rot_leye, state.rot_reye], "lr": args.lr_pose},
+          {"params": [state.rot_neck], "lr": args.lr_pose},
+          {"params": [state.rot_head], "lr": args.lr_pose},
+          {"params": [state.focal_norm], "lr": args.lr_cam},
+          {"params": [state.translation], "lr": 1e-3},
+      ]
+    else:
+      shape_groups = [
+          {"params": [state.id_head, state.id_eyes], "lr": args.lr_id},
+          {"params": [state.rot_leye, state.rot_reye], "lr": args.lr_pose},
+          {"params": [state.rot_neck, state.rot_head], "lr": args.lr_pose * 0.5},
+          {"params": [state.cam_aa], "lr": args.lr_pose * 0.3},
+          {"params": [state.cam_t, state.focal_norm], "lr": args.lr_cam * 0.2},
+          {"params": [state.translation], "lr": args.lr_pose * 0.15},
+      ]
+    if args.preset != "vhap_monocular" and (shape_mouth > 0):
       shape_groups.insert(1, {"params": [state.ex_lower], "lr": args.lr_ex})
     last = run_stage(
         "gnm_lmk_init_shape",
@@ -1445,7 +1558,7 @@ def main() -> int:
         f"[stop_after={args.stop_after}] later expression refine skipped; no mask loss",
         flush=True,
     )
-  if expr_groups:
+  if expr_groups and args.expr_iters > 0:
     expr_groups = trainable(expr_groups)
     last = run_stage(
         "gnm_lmk_init_expression",
@@ -1615,7 +1728,30 @@ def main() -> int:
       expression=state.expression().detach().numpy(),
       id_head=state.id_head.detach().numpy(),
       id_eyes=state.id_eyes.detach().numpy(),
-      expression_lower_face=state.ex_lower.detach().numpy(),
+      expression_left_eye=(
+          state.expression().detach().numpy()[:100]
+          if state.expr_dirs is not None and state.expr_dirs.shape[0] == 350
+          else state.ex_left.detach().numpy()
+      ),
+      expression_right_eye=(
+          state.expression().detach().numpy()[100:200]
+          if state.expr_dirs is not None and state.expr_dirs.shape[0] == 350
+          else state.ex_right.detach().numpy()
+      ),
+      expression_lower_face=(
+          state.expression().detach().numpy()[200:350]
+          if state.expr_dirs is not None and state.expr_dirs.shape[0] == 350
+          else state.ex_lower.detach().numpy()
+      ),
+      **(
+          {
+              "expression_pca_w": state.expr_w.detach().numpy(),
+              "expression_pca_dim": np.int32(state.expr_w.numel()),
+          }
+          if state.expr_w is not None and state.expr_dirs is not None
+          and state.expr_dirs.shape[0] == 350
+          else {}
+      ),
       rotations=state.rotations().detach().numpy(),
       translation=state.translation.detach().numpy(),
       cam_aa=state.cam_aa.detach().numpy(),
