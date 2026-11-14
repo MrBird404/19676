@@ -7,7 +7,9 @@ from pathlib import Path
 
 import numpy as np
 
-_MP2DLIB_ROOT = Path(__file__).resolve().parent.parent / "detectors" / "Mediapipe_2_Dlib_Landmarks-main"
+_here = Path(__file__).resolve().parent
+_ws = next(p for p in [_here, *_here.parents] if (p / "detectors").is_dir())
+_MP2DLIB_ROOT = _ws / "detectors" / "Mediapipe_2_Dlib_Landmarks-main"
 if _MP2DLIB_ROOT.is_dir() and str(_MP2DLIB_ROOT) not in sys.path:
   sys.path.insert(0, str(_MP2DLIB_ROOT))
 from mediapipe2dlib.mp2dlib import mp2dlib_correspondence as MP2DLIB_PAIRS  # noqa: E402

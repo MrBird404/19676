@@ -11,7 +11,7 @@ import numpy as np
 import trimesh
 
 ROOT = Path(__file__).resolve().parent
-REPO = ROOT.parent / "GNM-main"
+REPO = next(p for p in [ROOT, *ROOT.parents] if (p / "GNM-main").is_dir()) / "GNM-main"
 OUT = ROOT.parent / "gnm_fit_out" / "lmk68_audit"
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(ROOT))

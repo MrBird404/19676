@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent
-REPO = ROOT.parent / "GNM-main"
+REPO = next(p for p in [ROOT, *ROOT.parents] if (p / "GNM-main").is_dir()) / "GNM-main"
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(ROOT))
 

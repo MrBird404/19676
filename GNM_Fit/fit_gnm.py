@@ -662,6 +662,27 @@ def main() -> int:
       help="If >0 with vhap_monocular: PCA the 350 face expression bases down to this "
            "many coeffs (FLAME-like). 0 = optimize all left/right/lower dims.",
   )
+  p.add_argument(
+      "--sam_eye_centers",
+      type=Path,
+      default=None,
+      help="NPZ with centers[T,2,2] from photometric/sam_eyes_*.py. After shape, "
+           "only rot_leye/reye are fit to that frame's pupil centers. "
+           "vhap_monocular default: <landmarks_dir>/flow_frame0/sam_eyes/centers.npz "
+           "when that file exists.",
+  )
+  p.add_argument("--sam_eye_iters", type=int, default=40)
+  p.add_argument(
+      "--sam_eye_verts",
+      type=str,
+      default="17303,17689",
+      help="Two GNM vertex ids used as pupil proxies (comma-separated).",
+  )
+  p.add_argument(
+      "--no_sam_eyes",
+      action="store_true",
+      help="Skip the post-shape SAM pupil-center eye-joint step.",
+  )
   args = p.parse_args()
   if args.preset == "vhap_monocular":
     # Align with VHAP-main output/.../config.yml LossWeightConfig + LearningRateConfig
@@ -1090,6 +1111,8 @@ def main() -> int:
 
   t0 = time.time()
   dump_stage("0_init", "init", stage_bgr)
+  sam_eye_err = None
+  sam_eye_centers_used = None
 
   def weighted_landmark_loss(pred_xy: torch.Tensor, conf: torch.Tensor) -> torch.Tensor:
     if args.preset == "vhap_monocular":
@@ -1125,8 +1148,15 @@ def main() -> int:
   def metric_reg(reg_id: bool, reg_ex: bool, reg_joints: bool) -> torch.Tensor:
     reg = torch.tensor(0.0)
     if reg_id:
-      scaled = id_scale @ state.identity()
-      reg = reg + args.reg_id * (scaled ** 2).mean()
+      if args.preset == "vhap_monocular":
+        # VHAP compute_regularization_energy: reg_shape * mean((shape/std)^2),
+        # std_shape=1 → coefficient L2, not vertex-displacement scaling.
+        # Teeth dims stay zero; mean only over optimizable head+eyes coeffs.
+        id_coef = torch.cat([state.id_head, state.id_eyes], dim=0)
+        reg = reg + args.reg_id * (id_coef ** 2).mean()
+      else:
+        scaled = id_scale @ state.identity()
+        reg = reg + args.reg_id * (scaled ** 2).mean()
     if reg_ex:
       if state.expr_w is not None:
         reg = reg + args.reg_ex * (state.expr_w ** 2).mean()
@@ -1138,9 +1168,10 @@ def main() -> int:
         scaled_ex = ex_scale_lower @ state.ex_lower
         reg = reg + args.reg_ex * (scaled_ex ** 2).mean()
     if reg_joints and args.preset == "vhap_monocular":
-      # VHAP compute_joint_L2_energy: reg_neck/reg_jaw 0.3, reg_eyes 0.03.
-      # Jaw y/z is multiplied by reg_jaw again, and negative jaw-x is penalized.
-      reg = reg + args.reg_joint * (state.rot_neck ** 2).mean()
+      # VHAP compute_joint_L2_energy regularizes anatomical joints only:
+      # neck_pose / jaw / eyes. Global root `rotation` has no pull-to-zero.
+      # GNM's rot_neck is that root (whole-head rigid), not FLAME neck_pose,
+      # so it must stay free. GNM has no separate anatomical neck term.
       jaw = state.rot_head
       jaw_term = (jaw ** 2).mean() + torch.relu(-jaw[0]) * 10.0
       jaw_term = jaw_term + (jaw[1:] ** 2).mean() * args.reg_jaw_yz
@@ -1337,6 +1368,14 @@ def main() -> int:
       reg_joints=True,
   )
   dump_stage("1_rigid", f"stage1 rigid only ({args.lmk_set})", stage_bgr)
+  with torch.no_grad():
+    neck = state.rot_neck.detach()
+    print(
+        f"[pose] after rigid  rot_neck={neck.tolist()}  "
+        f"norm={float(torch.linalg.norm(neck)):.4f} rad "
+        f"({float(torch.linalg.norm(neck)) * 180.0 / np.pi:.2f} deg)",
+        flush=True,
+    )
   if args.stop_after == "rigid":
     print("[stop_after=rigid] landmark rigid done; shape and later stages skipped", flush=True)
   elif args.preset == "safe_expr":
@@ -1420,6 +1459,121 @@ def main() -> int:
         "2_shape",
         f"stage2 shape (mouth={shape_mouth:g} sock={shape_sock:g} preset={args.preset})",
         stage_bgr,
+    )
+    with torch.no_grad():
+      neck = state.rot_neck.detach()
+      jaw = state.rot_head.detach()
+      print(
+          f"[pose] after shape  rot_neck={neck.tolist()}  "
+          f"norm={float(torch.linalg.norm(neck)):.4f} rad "
+          f"({float(torch.linalg.norm(neck)) * 180.0 / np.pi:.2f} deg)  "
+          f"rot_jaw_norm={float(torch.linalg.norm(jaw)):.4f}",
+          flush=True,
+      )
+
+  # After 68-point shape: aim eyeball joints at SAM3 pupil centers only.
+  # Face identity/expression/pose stay frozen. Photometric face stages come later.
+  sam_centers_path = args.sam_eye_centers
+  if sam_centers_path is None and args.preset == "vhap_monocular" and not args.no_sam_eyes:
+    auto = Path(args.landmarks).resolve().parent / "flow_frame0" / "sam_eyes" / "centers.npz"
+    if auto.is_file():
+      sam_centers_path = auto
+  if (
+      args.stop_after != "rigid"
+      and not args.no_sam_eyes
+      and sam_centers_path is not None
+      and Path(sam_centers_path).is_file()
+  ):
+    sam_npz = np.load(sam_centers_path, allow_pickle=True)
+    centers_all = np.asarray(sam_npz["centers"], dtype=np.float32)
+    if args.frame_index < 0 or args.frame_index >= centers_all.shape[0]:
+      raise ValueError(
+          f"sam_eye_centers has T={centers_all.shape[0]}, "
+          f"frame_index={args.frame_index} out of range"
+      )
+    target_np = centers_all[args.frame_index]
+    eye_vert_ids = [int(x) for x in str(args.sam_eye_verts).split(",") if x.strip()]
+    if len(eye_vert_ids) != 2:
+      raise ValueError(f"--sam_eye_verts needs two ints, got {args.sam_eye_verts!r}")
+    eye_uv = torch.as_tensor(eye_vert_ids, dtype=torch.long)
+    # Freeze everything except eyeball joints.
+    for t in (
+        state.id_head, state.id_eyes, state.ex_left, state.ex_right, state.ex_lower,
+        state.rot_neck, state.rot_head, state.translation,
+        state.cam_aa, state.cam_t, state.focal_norm,
+    ):
+      t.requires_grad_(False)
+    if state.expr_w is not None:
+      state.expr_w.requires_grad_(False)
+    anchor_l = state.rot_leye.detach().clone()
+    anchor_r = state.rot_reye.detach().clone()
+    state.rot_leye = torch.nn.Parameter(anchor_l.clone())
+    state.rot_reye = torch.nn.Parameter(anchor_r.clone())
+    opt_eye = torch.optim.Adam([state.rot_leye, state.rot_reye], lr=2e-2)
+    with torch.no_grad():
+      pred0 = project_xy(posed_verts_world()[eye_uv])
+      order = torch.argsort(pred0[:, 0])
+      # Image-left center ↔ currently more-left projected eye vertex.
+      sorted_c = target_np[np.argsort(target_np[:, 0])]
+      target = torch.zeros(2, 2, dtype=torch.float32)
+      target[order] = torch.as_tensor(sorted_c, dtype=torch.float32)
+    print(
+        f"\n==> gnm_lmk_sam_eyes  iters={args.sam_eye_iters}  "
+        f"centers={sam_centers_path}  verts={eye_vert_ids}  "
+        f"target={target.detach().numpy().tolist()}",
+        flush=True,
+    )
+    for _ in range(max(int(args.sam_eye_iters), 1)):
+      opt_eye.zero_grad()
+      pred = project_xy(posed_verts_world()[eye_uv])
+      loss = (pred - target).pow(2).sum()
+      # Spin about the gaze axis does not move the proxy point; keep near anchor.
+      loss = loss + 40.0 * (
+          (state.rot_leye - anchor_l).pow(2).sum()
+          + (state.rot_reye - anchor_r).pow(2).sum()
+      )
+      loss.backward()
+      opt_eye.step()
+    with torch.no_grad():
+      pred = project_xy(posed_verts_world()[eye_uv])
+      err = torch.linalg.norm(pred - target, dim=-1)
+      sam_eye_err = err.detach().numpy().astype(np.float32)
+      sam_eye_centers_used = target.detach().numpy().astype(np.float32)
+      print(
+          f"[sam_eyes] err {float(err[0]):.3f}/{float(err[1]):.3f}px  "
+          f"rot_leye={state.rot_leye.detach().tolist()}  "
+          f"rot_reye={state.rot_reye.detach().tolist()}",
+          flush=True,
+      )
+    if stage_bgr is not None:
+      vis = stage_bgr.copy()
+      pred_np = pred.detach().numpy()
+      for i in range(2):
+        tx, ty = int(round(float(sam_eye_centers_used[i, 0]))), int(
+            round(float(sam_eye_centers_used[i, 1]))
+        )
+        px, py = int(round(float(pred_np[i, 0]))), int(round(float(pred_np[i, 1])))
+        cv2.circle(vis, (tx, ty), 4, (0, 255, 0), 1, lineType=cv2.LINE_AA)
+        cv2.circle(vis, (tx, ty), 1, (0, 255, 0), -1, lineType=cv2.LINE_AA)
+        cv2.circle(vis, (px, py), 1, (0, 0, 255), -1, lineType=cv2.LINE_AA)
+        cv2.line(vis, (tx, ty), (px, py), (0, 255, 255), 1, lineType=cv2.LINE_AA)
+      label = (
+          f"sam_eyes  err={float(err[0]):.2f}/{float(err[1]):.2f}px  "
+          f"(green=SAM center, red=mesh)"
+      )
+      cv2.putText(vis, label, (16, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3)
+      cv2.putText(vis, label, (16, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+      eye_vis = args.out_dir / "stage_3_sam_eyes_gt_pred.jpg"
+      cv2.imwrite(str(eye_vis), vis)
+      print(f"  [dump] {eye_vis.name}", flush=True)
+    dump_stage("3_sam_eyes", "stage3 SAM pupil centers → eye joints only", stage_bgr)
+    state.rot_leye = state.rot_leye.detach().requires_grad_(True)
+    state.rot_reye = state.rot_reye.detach().requires_grad_(True)
+  elif args.stop_after != "rigid" and not args.no_sam_eyes:
+    print(
+        "[sam_eyes] skipped (no centers npz; pass --sam_eye_centers or place "
+        "flow_frame0/sam_eyes/centers.npz next to landmarks)",
+        flush=True,
     )
 
   run_later = args.stop_after == "all"
@@ -1765,6 +1919,18 @@ def main() -> int:
           k: v for k, v in last.items()
           if k not in final_m and np.isscalar(v)
       },
+      **(
+          {
+              "sam_eye_centers": sam_eye_centers_used,
+              "sam_eye_err": sam_eye_err,
+              "sam_eye_verts": np.asarray(
+                  [int(x) for x in str(args.sam_eye_verts).split(",") if x.strip()],
+                  dtype=np.int32,
+              ),
+          }
+          if sam_eye_centers_used is not None and sam_eye_err is not None
+          else {}
+      ),
   )
 
   summary = {

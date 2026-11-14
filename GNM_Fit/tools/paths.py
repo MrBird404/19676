@@ -6,7 +6,7 @@ from pathlib import Path
 
 TOOLS = Path(__file__).resolve().parent
 MEDIAPIPE = TOOLS.parent
-REPO_ROOT = MEDIAPIPE.parent
+REPO_ROOT = next(p for p in [MEDIAPIPE, *MEDIAPIPE.parents] if (p / "GNM-main").is_dir())
 GNM_MAIN = REPO_ROOT / "GNM-main"
 OFFICIAL_68 = GNM_MAIN / "gnm" / "shape" / "data" / "landmarks" / "head_sparse_68.txt"
 SPARSE68_V2_MOUTH_OUT2 = MEDIAPIPE / "head_sparse_68_v2_mouth_out2.txt"

@@ -25,8 +25,14 @@ import photo_fit
 from flow_photo import group, load_base, raster_mask
 from uvmask import tensor_mask
 
-PRIOR = Path("/root/autodl-tmp/gnm_fit_out/expression_v3/flow_frame0/track_global/track_params.npz")
-OUT = Path("/root/autodl-tmp/gnm_fit_out/expression_v3/flow_frame0/every20")
+PRIOR = Path(__import__("os").environ.get(
+    "TRACK_NPZ",
+    "/root/autodl-tmp/gnm_fit_out/expression_v3/flow_frame0/track_global/track_params.npz",
+))
+OUT = Path(__import__("os").environ.get(
+    "EXPORT_OUT",
+    "/root/autodl-tmp/gnm_fit_out/expression_v3/flow_frame0/every20",
+))
 _UV = Path(__file__).resolve().parent / "uv"
 PAINTED = _UV / "gnm_uv_from_flame_lmk68.png"
 EYE_TEX = _UV / "gnm_eye_uv.png"
@@ -146,12 +152,17 @@ def main() -> None:
     eye_tex = albedo_eye()
     face_tex = albedo_face()
 
+    def region(v, n):
+        if v.shape[-1] >= n:
+            return v[..., :n]
+        return F.pad(v, (0, n - v.shape[-1]))
+
     def expression_vec():
+        tongue = cur["tongue"] if "tongue" in cur else torch.zeros(32)
+        pupil = cur["pupil"] if "pupil" in cur else torch.zeros(1)
         return torch.cat([
-            F.pad(cur["leye"], (0, 100 - N_EYE)),
-            F.pad(cur["reye"], (0, 100 - N_EYE)),
-            state.ex_lower,
-            torch.zeros(33),
+            region(cur["leye"], 100), region(cur["reye"], 100),
+            state.ex_lower, tongue, pupil,
         ])
 
     def posed():
@@ -207,6 +218,9 @@ def main() -> None:
         state.translation = tensor(translation[t])
         cur["leye"] = tensor(ex_leye[t])
         cur["reye"] = tensor(ex_reye[t])
+        if "expression_tongue" in z.files:
+            cur["tongue"] = tensor(z["expression_tongue"][t])
+            cur["pupil"] = tensor(z["expression_pupil"][t])
         with torch.no_grad():
             verts = posed().detach().cpu().numpy()
             eye_out, eye_z = raster(eye_ids, eye_tri_uv, eye_tex)

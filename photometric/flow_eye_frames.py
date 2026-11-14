@@ -19,7 +19,10 @@ from nvdiffrast_render.camera import project_world_to_pixels
 from fit_gnm import FitState
 import photo_fit
 
-PRIOR = Path("/root/autodl-tmp/gnm_fit_out/expression_v3/flow_frame0/track_global/track_params.npz")
+PRIOR = Path(__import__("os").environ.get(
+    "TRACK_NPZ",
+    "/root/autodl-tmp/gnm_fit_out/expression_v3/flow_frame0/track_global/track_params.npz",
+))
 BACKUP = PRIOR.with_name("track_params_before_sam_eyes.npz")
 SAM = Path("/root/autodl-tmp/gnm_fit_out/expression_v3/flow_frame0/sam_eyes/centers.npz")
 LMK = Path("/root/autodl-tmp/gnm_fit_out/expression_v3/facepoints68.npz")
@@ -62,12 +65,18 @@ def main() -> None:
     err_out = np.zeros((n, 2), np.float32)
     uv = torch.tensor(UV_VERTS, dtype=torch.long)
 
+    def region(v, n):
+        v = tensor(v)
+        if v.shape[-1] >= n:
+            return v[..., :n]
+        return torch.nn.functional.pad(v, (0, n - v.shape[-1]))
+
     def expression():
+        tongue = z["expression_tongue"][t] if "expression_tongue" in z.files else np.zeros(32, np.float32)
+        pupil = z["expression_pupil"][t] if "expression_pupil" in z.files else np.zeros(1, np.float32)
         return torch.cat([
-            torch.nn.functional.pad(tensor(ex_leye[t]), (0, 88)),
-            torch.nn.functional.pad(tensor(ex_reye[t]), (0, 88)),
-            state.ex_lower,
-            torch.zeros(33),
+            region(ex_leye[t], 100), region(ex_reye[t], 100),
+            state.ex_lower, region(tongue, 32), region(pupil, 1),
         ])
 
     def posed():
