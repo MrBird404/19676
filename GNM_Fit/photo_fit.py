@@ -10,8 +10,8 @@ Deferred (not learned here): eyes / teeth / gums / tongue keep authored UV
 sheets; eye color and pupil size are later stages.
 
 Single frame init stages:
-  rgb_init_texture  cam, shape, skin residual, lights
-  rgb_init_all      + pose, neck/jaw, expression
+  rgb_init_texture  cam, shape, skin residual, lights; jaw ray-contour (two-sided)
+  rgb_init_all      + pose, neck/jaw, face expr PCA150; tex/lights frozen
   rgb_init_offset   + static offset (teeth, eyes, scalp, ears pinned)
 
 ``align_texture_except`` includes hair / boundary / neck like VHAP (UV
@@ -350,6 +350,7 @@ def build_photo_regions(gnm_np, faces: np.ndarray) -> dict:
   occ_v = np.nonzero(occluded)[0].astype(np.int64)
   # Bottom stays excluded on every stage so the neck cut is not pulled to the frame.
   # VHAP rgb_init_texture: align_boundary_except = hair, boundary (+ occluded).
+  # Later stages keep face boundary in AA (silhouette can move); jaw ray loss holds outline.
   hair_v = np.unique(faces[hair_f]).astype(np.int64) if hair_f.size else np.zeros(0, dtype=np.int64)
   bound_texture = np.unique(np.concatenate([occ_v, bottom, boundary_v, hair_v])).astype(np.int64)
   bound_later = np.unique(np.concatenate([occ_v, bottom])).astype(np.int64)
@@ -458,6 +459,15 @@ def run_photometric(
   tex_except = torch.as_tensor(regions["texture_except"], dtype=torch.long, device=device)
   bound_texture = torch.as_tensor(regions["bound_texture"], dtype=torch.long, device=device)
   bound_later = torch.as_tensor(regions["bound_later"], dtype=torch.long, device=device)
+  # Lower-face verts for one-sided outer-contour vs detected jaw points 0..16.
+  jaw_vid_np = np.unique(np.concatenate([
+      _group_ids(gnm_np, "chin_region"),
+      _group_ids(gnm_np, "left_cheek_region"),
+      _group_ids(gnm_np, "right_cheek_region"),
+      _group_ids(gnm_np, "left_parotid_region"),
+      _group_ids(gnm_np, "right_parotid_region"),
+  ])).astype(np.int64)
+  jaw_vids = torch.as_tensor(jaw_vid_np, dtype=torch.long)
   tile = int(args.photo_tex_res)
   skin_cover = torch.as_tensor(_skin_cover_mask(skin_face_uv, tile), device=device)
   print(
@@ -569,17 +579,62 @@ def run_photometric(
     )
     return verts, rast, out
 
+  def jaw_outer_loss(verts_world: torch.Tensor) -> torch.Tensor:
+    """Ray-radius lower-outline vs detected jaw points (two-sided).
+
+    Mid-jaw 3..13 only (skip near-ear 0..2 / 14..16). Detected 2D points are
+    visible-face outline, not anatomical iBUG. Along each ray from a face
+    center, mesh extent should match that point (±slack deadzone). Not
+    point-to-point vertex↔landmark.
+    """
+    w = float(getattr(args, "w_jaw_outer", 20.0))
+    # Mid contour only: 3..13 inclusive (11 pts). Need at least index 13.
+    jaw_ids = list(range(3, 14))
+    if w <= 0.0 or jaw_vids.numel() == 0 or gt_t.shape[0] <= jaw_ids[-1]:
+      return verts_world.new_zeros(())
+    slack = float(getattr(args, "jaw_outer_slack", 2.0))
+    # Face center: nose tip if present, else mean of non-jaw landmarks.
+    if gt_t.shape[0] > 30:
+      center = gt_t[30]
+    else:
+      center = gt_t[17:].mean(dim=0)
+    mesh_xy = project_xy(verts_world[jaw_vids])
+    rel = mesh_xy - center
+    loss = verts_world.new_zeros(())
+    n_used = 0
+    for i in jaw_ids:
+      d = gt_t[i] - center
+      gt_r = torch.linalg.norm(d)
+      if float(gt_r) < 1.0:
+        continue
+      u = d / gt_r
+      mesh_r = (rel * u.unsqueeze(0)).sum(dim=-1).max()
+      # Outside and inside: stick outline to detected radius (±slack).
+      err = mesh_r - gt_r
+      loss = loss + torch.relu(err - slack).pow(2) + torch.relu(-err - slack).pow(2)
+      n_used += 1
+    if n_used == 0:
+      return verts_world.new_zeros(())
+    return w * loss / float(n_used)
+
   def photo_loss(rast, out, w_rgb: float, w_lmk_term: float, use_offset_reg: bool):
     rgba = out["rgba"]
     pred = rgba[..., :3]
     # Every covered pixel paints the texture, including cap, neck, and clothes.
     vis = (rgba[..., 3:] > 0).detach()
     rgb_loss = ((pred - gt_rgb).abs() * vis).sum() / (vis.sum() * 3).clamp(min=1.0)
-    pred_xy = project_xy(sample_lmk3d(world_verts()))
+    verts_w = world_verts()
+    pred_xy = project_xy(sample_lmk3d(verts_w))
     lmk_loss = weighted_landmark_loss(pred_xy, conf)
+    jaw_out = jaw_outer_loss(verts_w)
     extra = metric_reg(
         state.id_head.requires_grad,
-        state.ex_lower.requires_grad,
+        (
+            (state.expr_w is not None and state.expr_w.requires_grad)
+            or state.ex_lower.requires_grad
+            or state.ex_left.requires_grad
+            or state.ex_right.requires_grad
+        ),
         state.rot_head.requires_grad,
     )
     albedo = skin_albedo()
@@ -588,6 +643,7 @@ def run_photometric(
     reg_diffuse = torch.relu(diffuse.max() - 1.0) + diffuse.var()
     loss = w_rgb * rgb_loss
     loss = loss + w_lmk_term * lmk_loss.to(loss.device)
+    loss = loss + jaw_out.to(loss.device)
     loss = loss + extra.to(loss.device)
     # VHAP default reg_tex_tv=1e4; we use a slightly lower weight for more high-freq.
     w_tv = float(getattr(args, "reg_tex_tv", 5.0e3))
@@ -609,6 +665,7 @@ def run_photometric(
         "rgb": float(rgb_loss.detach()),
         "lmk": float(err.mean()),
         "nose": float(err[27:36].mean()) if err.numel() >= 36 else float(err.mean()),
+        "jaw_out": float(jaw_out.detach()),
         "tv": float(tv.detach()),
         "lap": float(lap.detach()),
         "off": float(off.detach()) if torch.is_tensor(off) else float(off),
@@ -638,12 +695,19 @@ def run_photometric(
           state.id_head.clamp_(-5.0, 5.0)
         if state.id_eyes.requires_grad:
           state.id_eyes.clamp_(-5.0, 5.0)
+        if state.expr_w is not None and state.expr_w.requires_grad:
+          state.expr_w.clamp_(-1.5, 2.0)
+        if state.ex_left.requires_grad:
+          state.ex_left.clamp_(-4.0, 4.0)
+        if state.ex_right.requires_grad:
+          state.ex_right.clamp_(-4.0, 4.0)
         if state.ex_lower.requires_grad:
           state.ex_lower.clamp_(-4.0, 4.0)
       if i == 0 or (i + 1) % max(iters // 8, 1) == 0 or i + 1 == iters:
         print(
             f"  [{name}] {i+1:4d}/{iters}  rgb={last_log['rgb']:.4f}  "
             f"lmk={last_log['lmk']:.2f}  nose={last_log['nose']:.2f}  "
+            f"jaw_out={last_log.get('jaw_out', 0.0):.4f}  "
             f"tv={last_log['tv']:.6f}  off={last_log['off']:.5f}",
             flush=True,
         )
@@ -702,15 +766,36 @@ def run_photometric(
     print("[photo] stop after rgb_init_texture", flush=True)
 
   pose_rot = [state.rot_neck, state.rot_head]
+  # Face expr: PCA150 (expr_w) when set; else raw 350. Eye joints stay frozen.
+  if state.expr_w is not None:
+    expr_params = [state.expr_w]
+    expr_label = f"expr PCA{int(state.expr_w.numel())}"
+  else:
+    expr_params = [state.ex_left, state.ex_right, state.ex_lower]
+    expr_label = "expr 350 (leye/reye/lower)"
   if stop_after in ("rgb", "offset"):
-    print("[photo] rgb_init_all  + pose, neck/jaw, expression; eyes fixed", flush=True)
-    for t in pose_rot + [state.translation, state.ex_lower]:
+    # Freeze tex/lights so RGB pulls geometry/expr instead of repainting albedo.
+    # Shape stays free for fine adjust; jaw outer-contour loss blocks cheek blow-up.
+    tex_res.requires_grad_(False)
+    lights.requires_grad_(False)
+    print(
+        f"[photo] rgb_init_all  + pose, neck/jaw, shape, {expr_label}; "
+        "freeze tex+lights; eye joints fixed",
+        flush=True,
+    )
+    for t in shape_params + pose_rot + [state.translation] + expr_params:
       t.requires_grad_(True)
+    if state.expr_w is not None:
+      state.ex_left.requires_grad_(False)
+      state.ex_right.requires_grad_(False)
+      state.ex_lower.requires_grad_(False)
     log_rgb = run_loop(
         "rgb_init_all",
         rgb_iters,
-        appearance + [
-            {"params": [state.ex_lower], "lr": 5e-2},
+        [
+            {"params": shape_params, "lr": 5e-3},
+            {"params": cam_params, "lr": 5e-3},
+            {"params": expr_params, "lr": 5e-2},
             {"params": pose_rot, "lr": 5e-3},
             {"params": [state.translation], "lr": 1e-3},
         ],
@@ -726,12 +811,18 @@ def run_photometric(
 
   if stop_after == "offset":
     print("[photo] rgb_init_offset  static offset, teeth/eyes/scalp/ears pinned", flush=True)
+    tex_res.requires_grad_(True)
+    lights.requires_grad_(True)
+    for t in shape_params:
+      t.requires_grad_(True)
     offset.requires_grad_(True)
+    for t in expr_params:
+      t.requires_grad_(True)
     log_off = run_loop(
         "rgb_init_offset",
         off_iters,
         appearance + [
-            {"params": [state.ex_lower], "lr": 5e-2},
+            {"params": expr_params, "lr": 5e-2},
             {"params": pose_rot, "lr": 5e-3},
             {"params": [state.translation], "lr": 1e-3},
             {"params": [offset], "lr": 5e-4},
@@ -848,6 +939,40 @@ def _build_and_run(args) -> int:
       cam_t=p(params["cam_t"]),
       focal_norm=p(params["focal_norm"]),
   )
+  # Same face PCA150 as vhap_monocular landmark fit (350 -> K).
+  k_pca = int(getattr(args, "expr_pca_dim", 150))
+  if k_pca > 0:
+    pca_path = Path(getattr(args, "expr_pca", "") or "")
+    if not pca_path.is_file():
+      pca_path = Path(args.params).resolve().parent / f"gnm_face_expr_pca{k_pca}.npz"
+    if not pca_path.is_file():
+      raise FileNotFoundError(
+          f"expr PCA dims={k_pca} requested but missing {pca_path}; "
+          "pass --expr_pca or set --expr_pca_dim 0"
+      )
+    pca = np.load(pca_path)
+    dirs = np.asarray(pca["dirs"], dtype=np.float32)
+    if dirs.ndim != 2 or dirs.shape[0] != 350:
+      raise ValueError(f"PCA dirs should be (350, K), got {dirs.shape} from {pca_path}")
+    k_use = min(k_pca, dirs.shape[1])
+    dirs = dirs[:, :k_use]
+    if "expression_pca_w" in params.files:
+      w0 = np.asarray(params["expression_pca_w"], dtype=np.float32).reshape(-1)[:k_use]
+      if w0.shape[0] < k_use:
+        w0 = np.pad(w0, (0, k_use - w0.shape[0]))
+    else:
+      w0 = np.zeros(k_use, dtype=np.float32)
+    state.expr_dirs = torch.as_tensor(dirs, dtype=torch.float32)
+    state.expr_w = torch.tensor(w0, dtype=torch.float32, requires_grad=True)
+    args._expr_w0 = torch.tensor(w0, dtype=torch.float32)  # landmark anchor for all-stage reg
+    state.ex_left.requires_grad_(False)
+    state.ex_right.requires_grad_(False)
+    state.ex_lower.requires_grad_(False)
+    print(
+        f"[photo] face expr PCA{k_use} from {pca_path.name}  "
+        f"w0_L2={float(np.linalg.norm(w0)):.3f}",
+        flush=True,
+    )
   idx_t = torch.as_tensor(lmk_idx, dtype=torch.long)
   bary_t = torch.as_tensor(lmk_w, dtype=torch.float32)
   gt_t = torch.as_tensor(gt_xy)
@@ -875,7 +1000,23 @@ def _build_and_run(args) -> int:
       id_coef = torch.cat([state.id_head.reshape(-1), state.id_eyes.reshape(-1)], dim=0)
       reg = reg + args.reg_id * (id_coef ** 2).mean()
     if reg_ex:
-      reg = reg + args.reg_ex * (state.ex_lower ** 2).mean()
+      if state.expr_w is not None and state.expr_w.requires_grad:
+        # Anchor to landmark PCA init so all-stage photometry cannot inflate cheeks.
+        w0 = getattr(args, "_expr_w0", None)
+        if w0 is not None:
+          # Pull toward landmark PCA init (stops cheek/jaw inflation under photo loss).
+          reg = reg + float(getattr(args, "reg_ex_anchor", 1.0)) * ((state.expr_w - w0) ** 2).mean()
+        reg = reg + args.reg_ex * (state.expr_w ** 2).mean()
+      else:
+        ex_parts = []
+        if state.ex_left.requires_grad:
+          ex_parts.append(state.ex_left.reshape(-1))
+        if state.ex_right.requires_grad:
+          ex_parts.append(state.ex_right.reshape(-1))
+        if state.ex_lower.requires_grad:
+          ex_parts.append(state.ex_lower.reshape(-1))
+        if ex_parts:
+          reg = reg + args.reg_ex * torch.cat(ex_parts, dim=0).pow(2).mean()
     if reg_joints:
       # Root rot_neck is free (like VHAP rotation); do not pull it to 0.
       for t in (state.rot_head, state.rot_leye, state.rot_reye):
@@ -909,11 +1050,15 @@ def _build_and_run(args) -> int:
       w_lmk=w,
       faces=faces,
   )
-  np.savez(
-      args.out_dir / "frame_photo_params.npz",
+  with torch.no_grad():
+    ex_full = state.expression().detach().cpu().numpy()
+  save_kw = dict(
       id_head=state.id_head.detach().numpy(),
       id_eyes=state.id_eyes.detach().numpy(),
-      expression_lower_face=state.ex_lower.detach().numpy(),
+      expression_left_eye=ex_full[:100],
+      expression_right_eye=ex_full[100:200],
+      expression_lower_face=ex_full[200:350],
+      expression=ex_full,
       rotations=state.rotations().detach().numpy(),
       translation=state.translation.detach().numpy(),
       cam_aa=state.cam_aa.detach().numpy(),
@@ -923,6 +1068,10 @@ def _build_and_run(args) -> int:
       rmse_all=photo.get("rmse_all", 0.0),
       rmse_nose=photo.get("rmse_nose", 0.0),
   )
+  if state.expr_w is not None:
+    save_kw["expression_pca_w"] = state.expr_w.detach().cpu().numpy()
+    save_kw["expression_pca_dim"] = np.int32(state.expr_w.numel())
+  np.savez(args.out_dir / "frame_photo_params.npz", **save_kw)
   summary = {k: v for k, v in photo.items() if k not in ("photo_tex", "photo_all", "photo_offset")}
   summary["photo_tex"] = photo.get("photo_tex", {})
   summary["photo_all"] = photo.get("photo_all", {})
@@ -957,8 +1106,38 @@ def main() -> int:
   p.add_argument("--nose_weight", type=float, default=10.0)
   p.add_argument("--reg_id", type=float, default=0.3)
   p.add_argument("--reg_ex", type=float, default=0.03)
+  p.add_argument(
+      "--reg_ex_anchor",
+      type=float,
+      default=1.0,
+      help="When PCA expr is on, weight of ||expr_w - w_landmark||^2 in photo stages.",
+  )
+  p.add_argument(
+      "--w_jaw_outer",
+      type=float,
+      default=20.0,
+      help="Two-sided lower-outline vs detected jaw points 3..13 (ray radius; not point-to-point). 0 disables.",
+  )
+  p.add_argument(
+      "--jaw_outer_slack",
+      type=float,
+      default=2.0,
+      help="Pixels of deadzone around detected radius before jaw_outer penalty (both in and out).",
+  )
   p.add_argument("--reg_joint", type=float, default=0.3)
   p.add_argument("--reg_jaw_yz", type=float, default=3.0)
+  p.add_argument(
+      "--expr_pca_dim",
+      type=int,
+      default=150,
+      help="Face expression PCA dim (350->K), same as fit_gnm vhap_monocular. 0 = raw 350.",
+  )
+  p.add_argument(
+      "--expr_pca",
+      type=Path,
+      default=None,
+      help="Optional gnm_face_expr_pcaK.npz; default is next to --params.",
+  )
   args = p.parse_args()
   return _build_and_run(args)
 
