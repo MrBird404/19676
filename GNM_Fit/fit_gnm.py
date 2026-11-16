@@ -527,6 +527,27 @@ def main() -> int:
   p = argparse.ArgumentParser(description=__doc__)
   p.add_argument("--landmarks", type=Path, required=True)
   p.add_argument("--init", type=Path, required=True)
+  p.add_argument(
+      "--warm_params",
+      type=Path,
+      default=None,
+      help="Optional finished frame_*_params.npz to warm-start identity/pose/camera. "
+           "Skips rigid; freezes rot_neck/rot_head/translation; continues with shape "
+           "(+ SAM eyes). Use after neck/shoulder.",
+  )
+  p.add_argument(
+      "--neck_len",
+      type=float,
+      default=None,
+      help="If set (with optional --neck_rad), rebake deform_neck into static_offset "
+           "after shape/SAM using this axial length scale.",
+  )
+  p.add_argument(
+      "--neck_rad",
+      type=float,
+      default=None,
+      help="Radial thicken scale for post-shape deform_neck rebake (default 1.0).",
+  )
   p.add_argument("--out_dir", type=Path, required=True)
   p.add_argument("--lmk_set", choices=("dense468", "sparse68"), default="sparse68")
   p.add_argument(
@@ -870,6 +891,29 @@ def main() -> int:
         f"landmark_file has {len(lmk_idx)} points but GT {args.lmk_set} has {n_lmk}"
     )
   state = FitState.from_init(init)
+  warm = None
+  if args.warm_params is not None:
+    warm = np.load(args.warm_params, allow_pickle=True)
+    rot_w = np.asarray(warm["rotations"], dtype=np.float32)
+    with torch.no_grad():
+      state.id_head.copy_(torch.as_tensor(warm["id_head"], dtype=torch.float32))
+      state.id_eyes.copy_(torch.as_tensor(warm["id_eyes"], dtype=torch.float32))
+      if "expression_left_eye" in warm.files:
+        state.ex_left.copy_(torch.as_tensor(warm["expression_left_eye"], dtype=torch.float32))
+      if "expression_right_eye" in warm.files:
+        state.ex_right.copy_(torch.as_tensor(warm["expression_right_eye"], dtype=torch.float32))
+      state.ex_lower.copy_(
+          torch.as_tensor(warm["expression_lower_face"], dtype=torch.float32)
+      )
+      state.rot_neck.copy_(torch.as_tensor(rot_w[0], dtype=torch.float32))
+      state.rot_head.copy_(torch.as_tensor(rot_w[1], dtype=torch.float32))
+      state.rot_leye.copy_(torch.as_tensor(rot_w[2], dtype=torch.float32))
+      state.rot_reye.copy_(torch.as_tensor(rot_w[3], dtype=torch.float32))
+      state.translation.copy_(torch.as_tensor(warm["translation"], dtype=torch.float32))
+      state.cam_aa.copy_(torch.as_tensor(warm["cam_aa"], dtype=torch.float32))
+      state.cam_t.copy_(torch.as_tensor(warm["cam_t"], dtype=torch.float32))
+      state.focal_norm.copy_(torch.as_tensor(warm["focal_norm"], dtype=torch.float32))
+    print(f"[warm] loaded {args.warm_params}  (skip rigid)", flush=True)
   if args.preset == "vhap_monocular" and args.expr_pca_dim > 0:
     # SVD of the 350 face bases in vertex space. Coeffs live in the top-K
     # right-singular subspace: c_face = Vt[:K].T @ w, same span truncation as FLAME.
@@ -1340,7 +1384,28 @@ def main() -> int:
 
   # Stage1: camera + head rigid body. Neck is the GNM root, so it is the
   # rigid rotation. Jaw (rot_head) and eyes stay at zero — they change the face.
-  if args.preset == "vhap_monocular":
+  # Warm start (e.g. after neck/shoulder) skips rigid and keeps loaded pose.
+  if warm is not None:
+    # Keep camera extrinsics + neck/shoulder pose from warm; shape may still
+    # move face identity / expression / eyes / focal / (optional) jaw.
+    if args.preset == "vhap_monocular":
+      state.cam_aa.requires_grad_(False)
+      state.cam_t.requires_grad_(False)
+    state.rot_neck.requires_grad_(False)
+    state.rot_head.requires_grad_(False)
+    state.translation.requires_grad_(False)
+    dump_stage("1_rigid", "warm-start skip rigid (loaded pose)", stage_bgr)
+    with torch.no_grad():
+      neck = state.rot_neck.detach()
+      print(
+          f"[pose] warm skip rigid  rot_neck={neck.tolist()}  "
+          f"norm={float(torch.linalg.norm(neck)):.4f} rad "
+          f"({float(torch.linalg.norm(neck)) * 180.0 / np.pi:.2f} deg)  "
+          f"freeze rot_neck/rot_head/translation",
+          flush=True,
+      )
+    last = {}
+  elif args.preset == "vhap_monocular":
     # VHAP fixes the camera RT and only solves focal length.
     # The head rigid body is root rotation (GNM neck) plus translation.
     state.cam_aa.requires_grad_(False)
@@ -1350,6 +1415,24 @@ def main() -> int:
         {"params": [state.focal_norm], "lr": args.lr_cam},
         {"params": [state.translation], "lr": 1e-3},
     ]
+    last = run_stage(
+        "gnm_lmk_init_rigid",
+        args.rigid_iters,
+        trainable(rigid_groups),
+        w_rigid,
+        reg_id=False,
+        reg_ex=False,
+        reg_joints=True,
+    )
+    dump_stage("1_rigid", f"stage1 rigid only ({args.lmk_set})", stage_bgr)
+    with torch.no_grad():
+      neck = state.rot_neck.detach()
+      print(
+          f"[pose] after rigid  rot_neck={neck.tolist()}  "
+          f"norm={float(torch.linalg.norm(neck)):.4f} rad "
+          f"({float(torch.linalg.norm(neck)) * 180.0 / np.pi:.2f} deg)",
+          flush=True,
+      )
   else:
     rigid_groups = [
         {"params": [state.rot_neck, state.rot_head], "lr": args.lr_pose},
@@ -1358,24 +1441,24 @@ def main() -> int:
         {"params": [state.focal_norm], "lr": args.lr_cam * 0.2},
         {"params": [state.translation], "lr": args.lr_pose * 0.2},
     ]
-  last = run_stage(
-      "gnm_lmk_init_rigid",
-      args.rigid_iters,
-      trainable(rigid_groups),
-      w_rigid,
-      reg_id=False,
-      reg_ex=False,
-      reg_joints=True,
-  )
-  dump_stage("1_rigid", f"stage1 rigid only ({args.lmk_set})", stage_bgr)
-  with torch.no_grad():
-    neck = state.rot_neck.detach()
-    print(
-        f"[pose] after rigid  rot_neck={neck.tolist()}  "
-        f"norm={float(torch.linalg.norm(neck)):.4f} rad "
-        f"({float(torch.linalg.norm(neck)) * 180.0 / np.pi:.2f} deg)",
-        flush=True,
+    last = run_stage(
+        "gnm_lmk_init_rigid",
+        args.rigid_iters,
+        trainable(rigid_groups),
+        w_rigid,
+        reg_id=False,
+        reg_ex=False,
+        reg_joints=True,
     )
+    dump_stage("1_rigid", f"stage1 rigid only ({args.lmk_set})", stage_bgr)
+    with torch.no_grad():
+      neck = state.rot_neck.detach()
+      print(
+          f"[pose] after rigid  rot_neck={neck.tolist()}  "
+          f"norm={float(torch.linalg.norm(neck)):.4f} rad "
+          f"({float(torch.linalg.norm(neck)) * 180.0 / np.pi:.2f} deg)",
+          flush=True,
+      )
   if args.stop_after == "rigid":
     print("[stop_after=rigid] landmark rigid done; shape and later stages skipped", flush=True)
   elif args.preset == "safe_expr":
@@ -1873,6 +1956,52 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001 — keep fit outputs even if render fails
       print(f"[render] failed: {exc}", flush=True)
 
+  # Neck/shoulder: pass through warm static_offset, or rebake deform_neck after
+  # shape/SAM so identity changes do not stale the pre-photo length/rad bake.
+  static_offset_np = None
+  neck_len_s = args.neck_len
+  neck_rad_s = args.neck_rad if args.neck_rad is not None else 1.0
+  if warm is not None and "static_offset" in warm.files and neck_len_s is None:
+    static_offset_np = np.asarray(warm["static_offset"], dtype=np.float32)
+  if neck_len_s is not None:
+    import neck_shoulder_l2 as neck_l2  # pylint: disable=import-outside-toplevel
+    from photo_fit import UV_MASKS  # pylint: disable=import-outside-toplevel
+
+    ids_np, wfade_np = neck_l2.neck_boundary_vertex_ids(gnm_np, faces, UV_MASKS)
+    with torch.no_grad():
+      posed = gnm(
+          state.identity()[None],
+          state.expression()[None],
+          state.rotations()[None],
+          state.translation[None],
+      )[0]
+      t_neck = gnm.get_posed_joint_transforms(
+          state.identity()[None],
+          state.rotations()[None],
+          state.translation[None],
+      )[0, 0]
+      rest = np.asarray(gnm_np(None, None, None, None), dtype=np.float32)
+      origin_rest, axis_rest = neck_l2.neck_axis_from_rest(rest, ids_np)
+      origin_r = torch.as_tensor(origin_rest, dtype=torch.float32)
+      axis_r = torch.as_tensor(axis_rest, dtype=torch.float32)
+      origin_w = t_neck[:3, :3] @ origin_r + t_neck[:3, 3]
+      axis_w = t_neck[:3, :3] @ axis_r
+      axis_w = axis_w / axis_w.norm().clamp(min=1e-8)
+      len_t = posed.new_tensor(float(neck_len_s))
+      rad_t = posed.new_tensor(float(neck_rad_s))
+      ids_t = torch.as_tensor(ids_np, dtype=torch.long)
+      w_t = torch.as_tensor(wfade_np, dtype=torch.float32)
+      deformed = neck_l2.deform_neck(
+          posed, ids_t, w_t, origin_w, axis_w, len_t, rad_t,
+      )
+      static_offset_np = (deformed - posed).detach().cpu().numpy().astype(np.float32)
+    print(
+        f"[neck] rebake static_offset  len={float(neck_len_s):.3f}  "
+        f"rad={float(neck_rad_s):.3f}  "
+        f"|off|_p95={float(np.percentile(np.linalg.norm(static_offset_np, axis=1), 95)):.5f}",
+        flush=True,
+    )
+
   np.savez(
       args.out_dir / f"frame_{video_frame:06d}_params.npz",
       version=args.version_name,
@@ -1914,6 +2043,19 @@ def main() -> int:
       K=k_np,
       RT=rt_np,
       image_size=np.array([width, height], dtype=np.int32),
+      **(
+          {"static_offset": static_offset_np}
+          if static_offset_np is not None
+          else {}
+      ),
+      **(
+          {
+              "neck_len_s": np.float32(neck_len_s),
+              "neck_rad_s": np.float32(neck_rad_s),
+          }
+          if neck_len_s is not None
+          else {}
+      ),
       **final_m,
       **{
           k: v for k, v in last.items()

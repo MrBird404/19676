@@ -497,6 +497,19 @@ def run_photometric(
   lights = torch.nn.Parameter(lights_uniform.clone())
   n_verts = int(regions["n_verts"])
   offset = torch.nn.Parameter(torch.zeros(n_verts, 3, dtype=torch.float32))
+  init_off = getattr(args, "init_static_offset", None)
+  if init_off is not None:
+    off_np = np.asarray(init_off, dtype=np.float32)
+    if off_np.shape != (n_verts, 3):
+      raise ValueError(
+          f"init_static_offset shape {off_np.shape} != ({n_verts}, 3)"
+      )
+    offset.data.copy_(torch.as_tensor(off_np, dtype=torch.float32))
+    print(
+        f"[photo] loaded static_offset from params  "
+        f"p95={float(np.percentile(np.linalg.norm(off_np, axis=1), 95) * 1000):.2f}mm",
+        flush=True,
+    )
 
   w_photo = np.array(w_lmk, dtype=np.float32, copy=True)
   if w_photo.shape[0] >= 17:
@@ -887,6 +900,10 @@ def _build_and_run(args) -> int:
   from fit_gnm import FitState, ibug68_vhap_weights
 
   params = np.load(args.params)
+  if "static_offset" in params.files:
+    args.init_static_offset = np.asarray(params["static_offset"], dtype=np.float32)
+  else:
+    args.init_static_offset = None
   lmk_npz = np.load(args.landmarks, allow_pickle=True)
   gt_xy = np.asarray(lmk_npz["landmarks"][args.frame_index], dtype=np.float32)
   width, height = [int(x) for x in lmk_npz["image_size"]]
