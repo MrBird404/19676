@@ -317,7 +317,8 @@ def build_photo_regions(gnm_np, faces: np.ndarray) -> dict:
   neck_uv_f = masked("neck")
   neck_f = np.unique(np.concatenate([neck_f, neck_uv_f])).astype(np.int64)
   neck_f = np.setdiff1d(neck_f, hair_f, assume_unique=False)
-  # VHAP: hair/boundary/neck in align_texture_except (texc detach).
+  # VHAP: hair/boundary/neck in align_texture_except (texc detach) —— 逼几何(而非贴图)
+  # 去贴合颈/边界。
   texture_except = np.unique(np.concatenate([
       occ_f, neck_f, bottom_f, boundary_f, hair_f,
   ])).astype(np.int64)
@@ -681,8 +682,8 @@ def run_photometric(
     loss = loss + w_lmk_term * lmk_loss.to(loss.device)
     loss = loss + jaw_out.to(loss.device)
     loss = loss + extra.to(loss.device)
-    # VHAP default reg_tex_tv=1e4; we use a slightly lower weight for more high-freq.
-    w_tv = float(getattr(args, "reg_tex_tv", 5.0e3))
+    # VHAP default reg_tex_tv=1e4; we lower it (2e3) to keep more high-freq detail.
+    w_tv = float(getattr(args, "reg_tex_tv", 2.0e3))
     loss = loss + w_tv * tv.to(loss.device)
     loss = loss + 100.0 * reg_diffuse
     lap = tex_res.new_zeros(())
@@ -783,10 +784,9 @@ def run_photometric(
       {"params": shape_params, "lr": 5e-3},
       {"params": cam_params, "lr": 5e-3},
   ]
-  if sem_coef is not None:
-    # Lightly free: neck (identity combo) + ear prot/size; strong small lr + band clamp.
-    appearance = appearance + [{"params": [sem_coef], "lr": float(getattr(args, "sem_lr", 3e-4))}]
-  print("[photo] rgb_init_texture  cam, shape, texture, lights", flush=True)
+  # L1(texture)阶段不碰耳/脖偏移：sem_coef 冻结，几何只靠 shape 微调。
+  # （rgb/offset 阶段才放开 sem_coef）
+  print("[photo] rgb_init_texture  cam, shape, texture, lights (sem frozen)", flush=True)
   log_tex = run_loop(
       "rgb_init_texture",
       tex_iters,
@@ -817,13 +817,15 @@ def run_photometric(
     expr_params = [state.ex_left, state.ex_right, state.ex_lower]
     expr_label = "expr 350 (leye/reye/lower)"
   if stop_after in ("rgb", "offset"):
-    # Freeze tex/lights so RGB pulls geometry/expr instead of repainting albedo.
-    # Shape stays free for fine adjust; jaw outer-contour loss blocks cheek blow-up.
-    tex_res.requires_grad_(False)
-    lights.requires_grad_(False)
+    # L2: 放开 texture(skin 残差)+lights 做联合优化（像 VHAP rgb_init_all），
+    # 用较低 lr 避免"贴图偷懒"；hair/boundary/neck 仍排除在纹理对齐外。
+    tex_res.requires_grad_(True)
+    lights.requires_grad_(True)
+    l2_tex_lr = float(getattr(args, "l2_tex_lr", 2e-3))
+    l2_light_lr = float(getattr(args, "l2_light_lr", 2e-3))
     print(
-        f"[photo] rgb_init_all  + pose, neck/jaw, shape, {expr_label}; "
-        "freeze tex+lights; eye joints fixed",
+        f"[photo] rgb_init_all  + pose, neck/jaw, shape, {expr_label}, "
+        f"tex(lr={l2_tex_lr:g})+lights(lr={l2_light_lr:g}); eye joints fixed",
         flush=True,
     )
     for t in shape_params + pose_rot + [state.translation] + expr_params:
@@ -837,6 +839,8 @@ def run_photometric(
         rgb_iters,
         [
             {"params": shape_params, "lr": 5e-3},
+            {"params": [tex_res], "lr": l2_tex_lr},
+            {"params": [lights], "lr": l2_light_lr},
             {"params": cam_params, "lr": 5e-3},
             {"params": expr_params, "lr": float(getattr(args, "expr_lr", 5e-2))},
             {"params": pose_rot, "lr": 5e-3},
@@ -895,9 +899,9 @@ def run_photometric(
   stats["rmse_jaw"] = float(err[:17].mean())
   stats["offset_mm_p95"] = float(np.percentile(np.linalg.norm((base_off + offset).detach().cpu().numpy(), axis=1), 95) * 1000.0)
   with torch.no_grad():
-    _sem_off = (torch.einsum("k,kvi->vi", sem_coef, sem_dirs_t).cpu().numpy()
-                if sem_coef is not None else 0.0)
-  full_off_np = (base_off + offset).detach().cpu().numpy() + _sem_off
+    # static_offset 只存 base_off + offset（不含 sem_off）；耳/脖语义位移由
+    # semantic_coef 单独承载，下游(render/下一阶段)统一各加一次，避免双计。
+    full_off_np = (base_off + offset).detach().cpu().numpy()
   stats["static_offset_full"] = full_off_np
   if sem_coef is not None:
     stats["semantic_coef"] = sem_coef.detach().cpu().numpy()
@@ -1141,8 +1145,8 @@ def _build_and_run(args) -> int:
   if state.expr_w is not None:
     save_kw["expression_pca_w"] = state.expr_w.detach().cpu().numpy()
     save_kw["expression_pca_dim"] = np.int32(state.expr_w.numel())
-  # Persist the full static offset (inherited base + learnable residual) so
-  # chaining L1->L2 keeps neck/shoulder + ear deformation. GitHub-save dropped it.
+  # Persist static offset = inherited base + learnable residual (NO sem_off;
+  # ear/neck semantic stays in semantic_coef so consumers add it exactly once).
   if photo.get("static_offset_full") is not None:
     save_kw["static_offset"] = photo["static_offset_full"]
   if getattr(args, "semantic_dirs", None) is not None:
@@ -1173,8 +1177,12 @@ def main() -> int:
   p.add_argument("--photo_max_side", type=int, default=1024)
   p.add_argument("--photo_tex_res", type=int, default=2048,
                  help="Skin tile resolution. VHAP tex_resolution default is 2048.")
-  p.add_argument("--reg_tex_tv", type=float, default=5.0e3,
-                 help="TV on skin albedo. VHAP uses 1e4; default is slightly lower.")
+  p.add_argument("--reg_tex_tv", type=float, default=2.0e3,
+                 help="TV on skin albedo. VHAP uses 1e4; we use 2e3 for more high-freq detail.")
+  p.add_argument("--l2_tex_lr", type=float, default=2e-3,
+                 help="L2 rgb_init_all skin-residual lr (joint texture+lights, VHAP-style).")
+  p.add_argument("--l2_light_lr", type=float, default=2e-3,
+                 help="L2 rgb_init_all SH lights lr.")
   p.add_argument("--photo_tex_iters", type=int, default=500)
   p.add_argument("--photo_iters", type=int, default=500)
   p.add_argument("--expr_lr", type=float, default=5e-2,
