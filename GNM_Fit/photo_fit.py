@@ -497,6 +497,7 @@ def run_photometric(
   lights = torch.nn.Parameter(lights_uniform.clone())
   n_verts = int(regions["n_verts"])
   offset = torch.nn.Parameter(torch.zeros(n_verts, 3, dtype=torch.float32))
+  base_off = torch.zeros(n_verts, 3, dtype=torch.float32)
   init_off = getattr(args, "init_static_offset", None)
   if init_off is not None:
     off_np = np.asarray(init_off, dtype=np.float32)
@@ -504,12 +505,31 @@ def run_photometric(
       raise ValueError(
           f"init_static_offset shape {off_np.shape} != ({n_verts}, 3)"
       )
-    offset.data.copy_(torch.as_tensor(off_np, dtype=torch.float32))
+    # Inherited static offset (neck/shoulder + upstream deform) is a FIXED base,
+    # not the small learnable residual — otherwise the ±8mm clamp / pin-zero in
+    # run_loop would crush it and zero the ear/pinned deformation.
+    base_off = torch.as_tensor(off_np, dtype=torch.float32)
     print(
         f"[photo] loaded static_offset from params  "
         f"p95={float(np.percentile(np.linalg.norm(off_np, axis=1), 95) * 1000):.2f}mm",
         flush=True,
     )
+
+  sem_dirs_t = None
+  sem_coef = None
+  sem_init = None
+  sem_band = None
+  _sd = getattr(args, "semantic_dirs", None)
+  if _sd is not None:
+    sem_dirs_t = torch.as_tensor(np.asarray(_sd, np.float32))  # (K,V,3) metres/unit, CPU like base_off
+    _sc = np.asarray(getattr(args, "semantic_coef"), np.float32)
+    sem_coef = torch.nn.Parameter(torch.as_tensor(_sc))
+    sem_init = torch.as_tensor(_sc)
+    _names = [str(x) for x in np.asarray(getattr(args, "semantic_names", [""] * _sc.shape[0]))]
+    _band = np.array([2.0 if ("ear" in n) else 3.0 for n in _names], np.float32) \
+        if len(_names) == _sc.shape[0] else np.full(_sc.shape[0], 2.0, np.float32)
+    sem_band = torch.as_tensor(_band)
+    print(f"[photo] semantic coef trainable K={_sc.shape[0]} init={_sc.round(3).tolist()} names={_names}", flush=True)
 
   w_photo = np.array(w_lmk, dtype=np.float32, copy=True)
   if w_photo.shape[0] >= 17:
@@ -557,7 +577,10 @@ def run_photometric(
   stats: dict = {"photo_size": [pw, ph], "photo_scale": scale}
 
   def world_verts() -> torch.Tensor:
-    return posed_verts_world() + offset
+    v = posed_verts_world() + base_off + offset
+    if sem_coef is not None:
+      v = v + torch.einsum("k,kvi->vi", sem_coef, sem_dirs_t)
+    return v
 
   def skin_albedo() -> torch.Tensor:
     # VHAP: painted/authored base + residual, then clamp.
@@ -760,6 +783,9 @@ def run_photometric(
       {"params": shape_params, "lr": 5e-3},
       {"params": cam_params, "lr": 5e-3},
   ]
+  if sem_coef is not None:
+    # Lightly free: neck (identity combo) + ear prot/size; strong small lr + band clamp.
+    appearance = appearance + [{"params": [sem_coef], "lr": float(getattr(args, "sem_lr", 3e-4))}]
   print("[photo] rgb_init_texture  cam, shape, texture, lights", flush=True)
   log_tex = run_loop(
       "rgb_init_texture",
@@ -774,6 +800,10 @@ def run_photometric(
   if dump_stage is not None:
     dump_stage("4_photo_tex", "rgb_init_texture", stage_bgr)
   stats["photo_tex"] = log_tex
+  if sem_coef is not None:
+    with torch.no_grad():
+      sem_coef.clamp_(sem_init - sem_band, sem_init + sem_band)
+    print(f"[photo] semantic coef after tex={[round(float(c), 3) for c in sem_coef]}", flush=True)
   stats["stop_after"] = stop_after
   if stop_after == "tex":
     print("[photo] stop after rgb_init_texture", flush=True)
@@ -808,9 +838,11 @@ def run_photometric(
         [
             {"params": shape_params, "lr": 5e-3},
             {"params": cam_params, "lr": 5e-3},
-            {"params": expr_params, "lr": 5e-2},
+            {"params": expr_params, "lr": float(getattr(args, "expr_lr", 5e-2))},
             {"params": pose_rot, "lr": 5e-3},
             {"params": [state.translation], "lr": 1e-3},
+            {"params": ([sem_coef] if sem_coef is not None else []),
+             "lr": float(getattr(args, "sem_lr", 3e-4))},
         ],
         w_rgb=30.0,
         w_lmk_term=lmk_w,
@@ -821,6 +853,10 @@ def run_photometric(
     if dump_stage is not None:
       dump_stage("5_photo", "rgb_init_all, jaw landmarks off", stage_bgr)
     stats["photo_all"] = log_rgb
+    if sem_coef is not None:
+      with torch.no_grad():
+        sem_coef.clamp_(sem_init - sem_band, sem_init + sem_band)
+      print(f"[photo] semantic coef after all={[round(float(c), 3) for c in sem_coef]}", flush=True)
 
   if stop_after == "offset":
     print("[photo] rgb_init_offset  static offset, teeth/eyes/scalp/ears pinned", flush=True)
@@ -857,7 +893,14 @@ def run_photometric(
   stats["rmse_all"] = float(err.mean())
   stats["rmse_nose"] = float(err[27:36].mean())
   stats["rmse_jaw"] = float(err[:17].mean())
-  stats["offset_mm_p95"] = float(np.percentile(np.linalg.norm(offset.detach().cpu().numpy(), axis=1), 95) * 1000.0)
+  stats["offset_mm_p95"] = float(np.percentile(np.linalg.norm((base_off + offset).detach().cpu().numpy(), axis=1), 95) * 1000.0)
+  with torch.no_grad():
+    _sem_off = (torch.einsum("k,kvi->vi", sem_coef, sem_dirs_t).cpu().numpy()
+                if sem_coef is not None else 0.0)
+  full_off_np = (base_off + offset).detach().cpu().numpy() + _sem_off
+  stats["static_offset_full"] = full_off_np
+  if sem_coef is not None:
+    stats["semantic_coef"] = sem_coef.detach().cpu().numpy()
   with torch.no_grad():
     alb_out = skin_albedo().detach().cpu().numpy()
     res_out = tex_res.detach().cpu().numpy()
@@ -867,7 +910,7 @@ def run_photometric(
       residual=res_out,
       skin_base=skin_base.detach().cpu().numpy(),
       lights=lights.detach().cpu().numpy(),
-      static_offset=offset.detach().cpu().numpy(),
+      static_offset=full_off_np,
       pin=regions["pin"],
   )
   trimesh.Trimesh(vertices=verts, faces=faces, process=False).export(args.out_dir / "frame_photo.obj")
@@ -904,6 +947,16 @@ def _build_and_run(args) -> int:
     args.init_static_offset = np.asarray(params["static_offset"], dtype=np.float32)
   else:
     args.init_static_offset = None
+  if "semantic_dirs" in params.files and "semantic_coef" in params.files:
+    args.semantic_dirs = np.asarray(params["semantic_dirs"], dtype=np.float32)
+    args.semantic_coef = np.asarray(params["semantic_coef"], dtype=np.float32)
+    args.semantic_names = ([str(x) for x in np.asarray(params["semantic_names"])]
+                           if "semantic_names" in params.files
+                           else [""] * args.semantic_coef.shape[0])
+  else:
+    args.semantic_dirs = None
+    args.semantic_coef = None
+    args.semantic_names = None
   lmk_npz = np.load(args.landmarks, allow_pickle=True)
   gt_xy = np.asarray(lmk_npz["landmarks"][args.frame_index], dtype=np.float32)
   width, height = [int(x) for x in lmk_npz["image_size"]]
@@ -1088,8 +1141,17 @@ def _build_and_run(args) -> int:
   if state.expr_w is not None:
     save_kw["expression_pca_w"] = state.expr_w.detach().cpu().numpy()
     save_kw["expression_pca_dim"] = np.int32(state.expr_w.numel())
+  # Persist the full static offset (inherited base + learnable residual) so
+  # chaining L1->L2 keeps neck/shoulder + ear deformation. GitHub-save dropped it.
+  if photo.get("static_offset_full") is not None:
+    save_kw["static_offset"] = photo["static_offset_full"]
+  if getattr(args, "semantic_dirs", None) is not None:
+    save_kw["semantic_dirs"] = np.asarray(args.semantic_dirs, dtype=np.float32)
+    save_kw["semantic_names"] = np.array(getattr(args, "semantic_names", []))
+    save_kw["semantic_coef"] = (photo["semantic_coef"] if photo.get("semantic_coef") is not None
+                                else np.asarray(args.semantic_coef, dtype=np.float32))
   np.savez(args.out_dir / "frame_photo_params.npz", **save_kw)
-  summary = {k: v for k, v in photo.items() if k not in ("photo_tex", "photo_all", "photo_offset")}
+  summary = {k: v for k, v in photo.items() if k not in ("photo_tex", "photo_all", "photo_offset", "semantic_coef", "static_offset_full")}
   summary["photo_tex"] = photo.get("photo_tex", {})
   summary["photo_all"] = photo.get("photo_all", {})
   summary["photo_offset"] = photo.get("photo_offset", {})
@@ -1115,6 +1177,8 @@ def main() -> int:
                  help="TV on skin albedo. VHAP uses 1e4; default is slightly lower.")
   p.add_argument("--photo_tex_iters", type=int, default=500)
   p.add_argument("--photo_iters", type=int, default=500)
+  p.add_argument("--expr_lr", type=float, default=5e-2,
+                 help="expr lr in photo rgb_init_all stage (smaller = more stable).")
   p.add_argument("--photo_offset_iters", type=int, default=500)
   p.add_argument("--stop_after", choices=("tex", "rgb", "offset"), default="tex")
   p.add_argument("--init_appearance", type=Path, default=None,

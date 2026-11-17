@@ -642,6 +642,20 @@ def main() -> int:
       help="After landmarks: VHAP rgb_init_texture, rgb_init_all, rgb_init_offset. No silhouette.",
   )
   p.add_argument("--mask", type=Path, default=None, help="Unused. Masks are for compositing, not a loss.")
+  p.add_argument(
+      "--ear_mask_npz",
+      type=Path,
+      default=None,
+      help="npz with left/right ear masks (H,W). Adds a soft ear-mask loss during rigid/shape so the identity basis deforms ears naturally.",
+  )
+  p.add_argument(
+      "--w_ear_mask",
+      type=float,
+      default=0.0,
+      help="Weight of the ear-mask distance-transform loss (0 disables). Used with --ear_mask_npz.",
+  )
+  p.add_argument("--ear_dt_cap", type=float, default=24.0,
+                 help="Truncate ear distance-transform loss (px).")
   p.add_argument("--photo_max_side", type=int, default=1024)
   p.add_argument("--photo_tex_res", type=int, default=1024)
   p.add_argument("--photo_tex_iters", type=int, default=500)
@@ -1052,6 +1066,44 @@ def main() -> int:
         flip_y=True,
     )
 
+  # ---- optional ear-mask loss (soft, distance transform) ----
+  # Applied during rigid/shape so the identity basis deforms ears naturally,
+  # instead of a post-hoc per-vertex displacement that tears the ear root.
+  ear_idx_t = None
+  ear_dt_t = None
+  if args.ear_mask_npz is not None and args.w_ear_mask > 0:
+    ear_vids = np.unique(np.asarray(gnm_np.vertex_group_indices("ears"), dtype=np.int64))
+    ear_idx_t = torch.as_tensor(ear_vids, dtype=torch.long)
+    m = np.load(args.ear_mask_npz)
+    left = np.asarray(m["left"], np.float32)
+    right = np.asarray(m["right"], np.float32)
+    if left.shape != (height, width):
+      left = cv2.resize(left, (width, height), interpolation=cv2.INTER_NEAREST)
+      right = cv2.resize(right, (width, height), interpolation=cv2.INTER_NEAREST)
+    combined = ((left > 0.5) | (right > 0.5)).astype(np.uint8)
+    inv = (1 - combined).astype(np.uint8)
+    dt = cv2.distanceTransform(inv, cv2.DIST_L2, 5).astype(np.float32)
+    ear_dt_t = torch.as_tensor(dt, dtype=torch.float32)[None, None]
+    print(f"[ear] mask loss on {ear_vids.size} ear verts  w={args.w_ear_mask}  "
+          f"mask_px={int(combined.sum())}", flush=True)
+
+  def ear_mask_loss() -> torch.Tensor:
+    if ear_idx_t is None or ear_dt_t is None:
+      return gt_t.new_zeros(())
+    v = posed_verts_world()
+    xy = project_world_to_pixels(
+        v[ear_idx_t], state.camera_rt(), state.camera_k(width, height),
+        width, height, flip_y=True,
+    )
+    gx = 2.0 * xy[:, 0] / width - 1.0
+    gy = 2.0 * xy[:, 1] / height - 1.0
+    grid = torch.stack([gx, gy], dim=-1)[None, None]
+    d = torch.nn.functional.grid_sample(ear_dt_t, grid, align_corners=False)[0, 0, 0]
+    return d.clamp(max=float(args.ear_dt_cap)).mean()
+
+  def ear_extra() -> torch.Tensor:
+    return float(args.w_ear_mask) * ear_mask_loss()
+
   def metrics(pred_xy: torch.Tensor) -> dict[str, float]:
     err = torch.sqrt(((pred_xy.detach() - gt_t) ** 2).sum(-1))
     pred_np = pred_xy.detach()
@@ -1423,6 +1475,7 @@ def main() -> int:
         reg_id=False,
         reg_ex=False,
         reg_joints=True,
+        extra_loss=ear_extra,
     )
     dump_stage("1_rigid", f"stage1 rigid only ({args.lmk_set})", stage_bgr)
     with torch.no_grad():
@@ -1449,6 +1502,7 @@ def main() -> int:
         reg_id=False,
         reg_ex=False,
         reg_joints=True,
+        extra_loss=ear_extra,
     )
     dump_stage("1_rigid", f"stage1 rigid only ({args.lmk_set})", stage_bgr)
     with torch.no_grad():
@@ -1537,6 +1591,7 @@ def main() -> int:
         reg_ex=shape_mouth > 0 or args.preset == "vhap_monocular",
         reg_joints=True,
         score_mode="shape",
+        extra_loss=ear_extra,
     )
     dump_stage(
         "2_shape",
