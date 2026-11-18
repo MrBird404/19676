@@ -472,6 +472,37 @@ def run_photometric(
   neck_anchor_enabled = False   # 只有 L2 阶段且 --l2_neck_anchor 时置 True
   neck_anchor_weight = float(getattr(args, "w_l2_neck_anchor", 10.0))
 
+  # L2 open-region anchor: everything EXCEPT these groups is pinned to L2-start pos.
+  _open_csv = str(getattr(args, "l2_open_regions", "") or "").strip()
+  region_open_mask = None   # torch bool (n_verts,), True = allowed to move
+  region_ref = None         # L2-start world verts (locked on first photo_loss)
+  region_anchor_active = False
+  region_anchor_weight = float(getattr(args, "l2_region_anchor_w", 2000.0))
+  if _open_csv:
+    _grp_map = {
+        "eyes": ["eyes", "left_eye", "right_eye", "scleras", "irises", "pupils",
+                 "eye_sockets", "eye_interiors", "eye_exteriors"],
+        "nose": ["nose_region"],
+        "mouth": ["mouth_sock", "upper_lip", "lower_lip", "upper_lip_region",
+                  "lower_lip_region", "gums", "teeth", "tongue"],
+    }
+    _open_v = []
+    for tok in [t.strip() for t in _open_csv.split(",") if t.strip()]:
+      for nm in _grp_map.get(tok, [tok]):
+        try:
+          _open_v.append(_group_ids(gnm_np, nm))
+        except Exception:
+          pass
+    if _open_v:
+      _open_v = np.unique(np.concatenate(_open_v)).astype(np.int64)
+      region_open_mask = torch.zeros(rest.shape[0], dtype=torch.bool, device=device)
+      region_open_mask[torch.as_tensor(_open_v, dtype=torch.long, device=device)] = True
+      print(
+          f"[photo] L2 open-region anchor: {int(region_open_mask.sum())} verts movable, "
+          f"{int((~region_open_mask).sum())} pinned  (groups={_open_csv}, w={region_anchor_weight:g})",
+          flush=True,
+      )
+
   # Lower-face verts for one-sided outer-contour vs detected jaw points 0..16.
   jaw_vid_np = np.unique(np.concatenate([
       _group_ids(gnm_np, "chin_region"),
@@ -729,6 +760,17 @@ def run_photometric(
       nr = neck_ref.to(verts_w.device)
       neck_anchor = (((verts_w[neck_mask] - nr) * 1000.0).pow(2).sum(-1)).mean()  # mm^2 per vert
       loss = loss + neck_anchor_weight * neck_anchor.to(loss.device)
+    # L2 open-region anchor: pin every vertex OUTSIDE the open regions to its
+    # L2-start world position, so only eyes/nose/mouth geometry can change.
+    region_anchor = verts_w.new_zeros(())
+    if region_open_mask is not None and region_anchor_active:
+      nonlocal region_ref
+      if region_ref is None:
+        region_ref = verts_w.detach().clone()
+      keep = (~region_open_mask).to(verts_w.device)
+      rr = region_ref.to(verts_w.device)
+      region_anchor = (((verts_w[keep] - rr[keep]) * 1000.0).pow(2).sum(-1)).mean()
+      loss = loss + region_anchor_weight * region_anchor.to(loss.device)
     # VHAP default reg_tex_tv=1e4; we lower it (2e3) to keep more high-freq detail.
     w_tv = float(getattr(args, "reg_tex_tv", 2.0e3))
     loss = loss + w_tv * tv.to(loss.device)
@@ -900,6 +942,7 @@ def run_photometric(
       print(
           f"[photo] L2 neck/shoulder anchor ON  verts={int(neck_mask.sum())}  "
           f"w={neck_anchor_weight:g}", flush=True)
+    region_anchor_active = True   # only the rgb_init_all (L2) loop anchors the complement region
     log_rgb = run_loop(
         "rgb_init_all",
         rgb_iters,
@@ -981,6 +1024,12 @@ def run_photometric(
               f"{float(_err[0]):.2f}/{float(_err[1]):.2f}px  target={_tgt.detach().cpu().numpy().round(1).tolist()}",
               flush=True)
         stats["eye_center_err_px"] = [float(_err[0]), float(_err[1])]
+        # Re-render so the saved stage textured render matches the re-aligned gaze
+        # (the loop's dump ran before this eye-fit step).
+        with torch.no_grad():
+          _v, _rast, _out = render_pack(False, bound_later)
+          _predrgba = _out["rgba"][0].detach().float().cpu().numpy()
+        dump_photo_preview(args.out_dir, "rgb_init_all", rgb_np, _predrgba)
         state.rot_leye = state.rot_leye.detach()
         state.rot_reye = state.rot_reye.detach()
 
@@ -1215,7 +1264,27 @@ def _build_and_run(args) -> int:
       if w0.shape[0] < k_use:
         w0 = np.pad(w0, (0, k_use - w0.shape[0]))
     else:
-      w0 = np.zeros(k_use, dtype=np.float32)
+      # Seed expr_w from the CURRENT baked expression (ex_left/right/lower) so L2
+      # starts from the SAME face as L1. L1 carries a baked lower-face expression
+      # (e.g. ex_lower norm~5.7 from earlier stages); zeroing it here shifted the
+      # jaw/cheeks by ~2.5mm at L2 start even when everything else was frozen.
+      _le = (np.asarray(params["expression_left_eye"], np.float32).reshape(-1)
+             if "expression_left_eye" in params.files else np.zeros(100, np.float32))
+      _re = (np.asarray(params["expression_right_eye"], np.float32).reshape(-1)
+             if "expression_right_eye" in params.files else np.zeros(100, np.float32))
+      _lo = (np.asarray(params["expression_lower_face"], np.float32).reshape(-1)
+             if "expression_lower_face" in params.files else np.zeros(150, np.float32))
+      _full = np.concatenate([_le, _re, _lo]).astype(np.float32)
+      if float(np.linalg.norm(_full)) > 1e-8:
+        w0 = np.linalg.lstsq(dirs, _full, rcond=None)[0].astype(np.float32)
+        print(
+            f"[photo] seeded expr_w from baked expression norm={float(np.linalg.norm(_full)):.3f}"
+            f" -> pca({k_use}) w0={float(np.linalg.norm(w0)):.3f}"
+            f" resid={float(np.linalg.norm(_full - dirs @ w0)):.4f}",
+            flush=True,
+        )
+      else:
+        w0 = np.zeros(k_use, dtype=np.float32)
     state.expr_dirs = torch.as_tensor(dirs, dtype=torch.float32)
     state.expr_w = torch.tensor(w0, dtype=torch.float32, requires_grad=True)
     args._expr_w0 = torch.tensor(w0, dtype=torch.float32)  # landmark anchor for all-stage reg
@@ -1421,6 +1490,12 @@ def main() -> int:
       default=2.0,
       help="Pixels of deadzone around detected radius before jaw_outer penalty (both in and out).",
   )
+  p.add_argument("--l2_open_regions", type=str, default="",
+                 help="Comma-separated GNM vertex group names whose geometry is allowed to move in "
+                      "L2 (e.g. 'eyes,nose,mouth'). Every other vertex is pinned to the L2-start "
+                      "(=L1) world position. Empty = disabled (old behavior).")
+  p.add_argument("--l2_region_anchor_w", type=float, default=2000.0,
+                 help="Weight of the L2 complement-region anchor (pins verts outside --l2_open_regions).")
   p.add_argument("--reg_joint", type=float, default=0.3)
   p.add_argument("--reg_jaw_yz", type=float, default=3.0)
   p.add_argument(
