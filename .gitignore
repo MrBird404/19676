@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+# local notes / figures / data outputs are intentionally not part of the code repo
+notes/

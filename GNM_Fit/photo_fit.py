@@ -460,6 +460,18 @@ def run_photometric(
   tex_except = torch.as_tensor(regions["texture_except"], dtype=torch.long, device=device)
   bound_texture = torch.as_tensor(regions["bound_texture"], dtype=torch.long, device=device)
   bound_later = torch.as_tensor(regions["bound_later"], dtype=torch.long, device=device)
+  # 颈/肩顶点掩码（skin、y<0.18 的颈底/领口顶点），用于 L2 可选的颈肩锚固：
+  # 锚住 L2 起点处的颈肩世界顶点，让“颈阶段定肩颈、L2不动”可落地。
+  rest = np.asarray(gnm_np(None, None, None, None), dtype=np.float32)
+  _skin = _group_ids(gnm_np, "skin")
+  _neck = _skin[rest[_skin, 1] < 0.18]
+  neck_mask = torch.zeros(rest.shape[0], dtype=torch.bool)
+  neck_mask[torch.as_tensor(_neck, dtype=torch.long)] = True
+  neck_mask[pin] = False
+  neck_ref = None          # L2 起点处的颈肩世界顶点（首次 photo_loss 时锁定）
+  neck_anchor_enabled = False   # 只有 L2 阶段且 --l2_neck_anchor 时置 True
+  neck_anchor_weight = float(getattr(args, "w_l2_neck_anchor", 10.0))
+
   # Lower-face verts for one-sided outer-contour vs detected jaw points 0..16.
   jaw_vid_np = np.unique(np.concatenate([
       _group_ids(gnm_np, "chin_region"),
@@ -532,6 +544,29 @@ def run_photometric(
     sem_band = torch.as_tensor(_band)
     print(f"[photo] semantic coef trainable K={_sc.shape[0]} init={_sc.round(3).tolist()} names={_names}", flush=True)
 
+  cheek_dirs_t = None
+  cheek_coef = None
+  cheek_lo = -0.5
+  cheek_hi = float(getattr(args, "cheek_band", 2.5))
+  _cm = getattr(args, "cheek_modes", None)
+  if _cm is not None:
+    cm = np.load(_cm)
+    _keys = ["cheek_overall", "cheek_upper", "cheek_lower"]
+    if not all(k in cm.files for k in _keys):
+      _keys = sorted([k for k in cm.files if k.startswith("cheek")])
+    dirs_mm = np.stack([np.asarray(cm[k], np.float32) for k in _keys], 0)
+    if dirs_mm.shape[1] != n_verts:
+      raise ValueError(f"cheek modes {dirs_mm.shape} != n_verts {n_verts}")
+    cheek_dirs_t = torch.as_tensor(dirs_mm / 1000.0)  # metres per unit, CPU
+    _K = dirs_mm.shape[0]
+    _ci = getattr(args, "cheek_init", "1,0,0")
+    _cv = np.asarray([float(x) for x in str(_ci).split(",") if x.strip() != ""], np.float32)
+    if _cv.size < _K:
+      _cv = np.concatenate([_cv, np.zeros(_K - _cv.size, np.float32)])
+    _cv = _cv[:_K]
+    cheek_coef = torch.nn.Parameter(torch.as_tensor(_cv))
+    print(f"[photo] cheek modes loaded K={_K} from {_cm}  init={_cv.round(3).tolist()}", flush=True)
+
   w_photo = np.array(w_lmk, dtype=np.float32, copy=True)
   if w_photo.shape[0] >= 17:
     w_photo[:17] = 0.0
@@ -581,6 +616,8 @@ def run_photometric(
     v = posed_verts_world() + base_off + offset
     if sem_coef is not None:
       v = v + torch.einsum("k,kvi->vi", sem_coef, sem_dirs_t)
+    if cheek_coef is not None:
+      v = v + torch.einsum("k,kvi->vi", cheek_coef, cheek_dirs_t)
     return v
 
   def skin_albedo() -> torch.Tensor:
@@ -682,6 +719,16 @@ def run_photometric(
     loss = loss + w_lmk_term * lmk_loss.to(loss.device)
     loss = loss + jaw_out.to(loss.device)
     loss = loss + extra.to(loss.device)
+    # Optional neck/shoulder anchor: pin the neck/shoulder world verts to their
+    # position at L2 start (the neck stage output), so L2 does not twist them.
+    neck_anchor = verts_w.new_zeros(())
+    if neck_anchor_enabled and neck_mask is not None and bool(neck_mask.any()):
+      nonlocal neck_ref
+      if neck_ref is None:
+        neck_ref = verts_w[neck_mask].detach().clone()
+      nr = neck_ref.to(verts_w.device)
+      neck_anchor = (((verts_w[neck_mask] - nr) * 1000.0).pow(2).sum(-1)).mean()  # mm^2 per vert
+      loss = loss + neck_anchor_weight * neck_anchor.to(loss.device)
     # VHAP default reg_tex_tv=1e4; we lower it (2e3) to keep more high-freq detail.
     w_tv = float(getattr(args, "reg_tex_tv", 2.0e3))
     loss = loss + w_tv * tv.to(loss.device)
@@ -706,6 +753,7 @@ def run_photometric(
         "tv": float(tv.detach()),
         "lap": float(lap.detach()),
         "off": float(off.detach()) if torch.is_tensor(off) else float(off),
+        "neck_anchor": float(neck_anchor.detach()),
     }
 
   def run_loop(name: str, iters: int, groups: list[dict], w_rgb: float, w_lmk_term: float,
@@ -727,6 +775,8 @@ def run_photometric(
       with torch.no_grad():
         offset[pin] = 0
         offset.clamp_(-0.008, 0.008)
+        if cheek_coef is not None and cheek_coef.requires_grad:
+          cheek_coef.clamp_(cheek_lo, cheek_hi)
         state.focal_norm.clamp_(0.3, 5.0)
         if state.id_head.requires_grad:
           state.id_head.clamp_(-5.0, 5.0)
@@ -745,6 +795,7 @@ def run_photometric(
             f"  [{name}] {i+1:4d}/{iters}  rgb={last_log['rgb']:.4f}  "
             f"lmk={last_log['lmk']:.2f}  nose={last_log['nose']:.2f}  "
             f"jaw_out={last_log.get('jaw_out', 0.0):.4f}  "
+            f"neck_anchor={last_log.get('neck_anchor', 0.0):.3f}  "
             f"tv={last_log['tv']:.6f}  off={last_log['off']:.5f}",
             flush=True,
         )
@@ -769,6 +820,7 @@ def run_photometric(
   rgb_iters = int(args.photo_iters)
   off_iters = int(getattr(args, "photo_offset_iters", 500))
   stop_after = getattr(args, "stop_after", "tex")
+  freeze_cam_neck = bool(getattr(args, "freeze_cam_neck", False))
   lmk_w = float(getattr(args, "w_landmark", 10.0))
   # Eyeball joints stay at the pre-photo rotation.
   state.rot_leye.requires_grad_(False)
@@ -778,6 +830,9 @@ def run_photometric(
   cam_params = [state.cam_aa, state.cam_t, state.focal_norm]
   for t in shape_params + cam_params:
     t.requires_grad_(True)
+  if freeze_cam_neck:
+    for t in cam_params:
+      t.requires_grad_(False)  # camera frozen: keep the fitted shoulder registration
   appearance = [
       {"params": [tex_res], "lr": 5e-3},
       {"params": [lights], "lr": 5e-3},
@@ -816,7 +871,7 @@ def run_photometric(
   else:
     expr_params = [state.ex_left, state.ex_right, state.ex_lower]
     expr_label = "expr 350 (leye/reye/lower)"
-  if stop_after in ("rgb", "offset"):
+  if stop_after in ("rgb", "offset", "cheek"):
     # L2: 放开 texture(skin 残差)+lights 做联合优化（像 VHAP rgb_init_all），
     # 用较低 lr 避免"贴图偷懒"；hair/boundary/neck 仍排除在纹理对齐外。
     tex_res.requires_grad_(True)
@@ -828,12 +883,22 @@ def run_photometric(
         f"tex(lr={l2_tex_lr:g})+lights(lr={l2_light_lr:g}); eye joints fixed",
         flush=True,
     )
-    for t in shape_params + pose_rot + [state.translation] + expr_params:
+    for t in shape_params + ([] if freeze_cam_neck else pose_rot) + ([] if freeze_cam_neck else [state.translation]) + expr_params:
       t.requires_grad_(True)
+    if freeze_cam_neck:
+      for t in pose_rot + [state.translation]:
+        t.requires_grad_(False)  # neck+head pose/translation frozen
     if state.expr_w is not None:
       state.ex_left.requires_grad_(False)
       state.ex_right.requires_grad_(False)
       state.ex_lower.requires_grad_(False)
+    offset.requires_grad_(False)
+    neck_anchor_enabled = bool(getattr(args, "l2_neck_anchor", False))
+    neck_ref = None
+    if neck_anchor_enabled:
+      print(
+          f"[photo] L2 neck/shoulder anchor ON  verts={int(neck_mask.sum())}  "
+          f"w={neck_anchor_weight:g}", flush=True)
     log_rgb = run_loop(
         "rgb_init_all",
         rgb_iters,
@@ -845,6 +910,8 @@ def run_photometric(
             {"params": expr_params, "lr": float(getattr(args, "expr_lr", 5e-2))},
             {"params": pose_rot, "lr": 5e-3},
             {"params": [state.translation], "lr": 1e-3},
+            {"params": ([cheek_coef] if cheek_coef is not None else []),
+             "lr": float(getattr(args, "cheek_lr", 2e-2))},
             {"params": ([sem_coef] if sem_coef is not None else []),
              "lr": float(getattr(args, "sem_lr", 3e-4))},
         ],
@@ -861,6 +928,12 @@ def run_photometric(
       with torch.no_grad():
         sem_coef.clamp_(sem_init - sem_band, sem_init + sem_band)
       print(f"[photo] semantic coef after all={[round(float(c), 3) for c in sem_coef]}", flush=True)
+    if cheek_coef is not None:
+      with torch.no_grad():
+        cheek_coef.clamp_(cheek_lo, cheek_hi)
+      print(f"[photo] cheek coef after all={[round(float(c), 3) for c in cheek_coef]}", flush=True)
+
+  neck_anchor_enabled = False   # 颈/肩锚固只作用于 L2，不遗留到 offset/cheek 阶段
 
   if stop_after == "offset":
     print("[photo] rgb_init_offset  static offset, teeth/eyes/scalp/ears pinned", flush=True)
@@ -878,6 +951,8 @@ def run_photometric(
             {"params": expr_params, "lr": 5e-2},
             {"params": pose_rot, "lr": 5e-3},
             {"params": [state.translation], "lr": 1e-3},
+            {"params": ([cheek_coef] if cheek_coef is not None else []),
+             "lr": float(getattr(args, "cheek_lr", 2e-2))},
             {"params": [offset], "lr": 5e-4},
         ],
         w_rgb=30.0,
@@ -889,6 +964,60 @@ def run_photometric(
     if dump_stage is not None:
       dump_stage("6_offset", "rgb_init_offset, scalp/ears/teeth/eyes pinned", stage_bgr)
     stats["photo_offset"] = log_off
+
+  if stop_after == "cheek" and cheek_coef is not None:
+    print("[photo] cheek  fit 3 cheek modes by photometric (all else frozen)", flush=True)
+    _freeze = [
+        state.id_head, state.id_eyes, state.ex_lower, state.rot_neck, state.rot_head,
+        state.rot_leye, state.rot_reye, state.translation, state.cam_aa, state.cam_t,
+        state.focal_norm, offset, tex_res, lights,
+    ]
+    if state.expr_w is not None:
+      _freeze.append(state.expr_w)
+    if state.ex_left is not None:
+      _freeze.append(state.ex_left)
+    if state.ex_right is not None:
+      _freeze.append(state.ex_right)
+    if sem_coef is not None:
+      _freeze.append(sem_coef)
+    for t in _freeze:
+      t.requires_grad_(False)
+    cheek_coef.requires_grad_(True)
+    cheek_iters = int(getattr(args, "cheek_iters", 150))
+    cheek_lr = float(getattr(args, "cheek_lr", 2e-2))
+    cheek_band = float(getattr(args, "cheek_band", 2.5))
+    copt = torch.optim.Adam([cheek_coef], lr=cheek_lr)
+    for i in range(cheek_iters):
+      copt.zero_grad()
+      _verts, _rast, _out = render_pack(False, bound_later)
+      _rgba = _out["rgba"]
+      _pred = _rgba[..., :3]
+      _vis = (_rgba[..., 3:] > 0).detach()
+      _rgb = ((_pred - gt_rgb).abs() * _vis).sum() / (_vis.sum() * 3).clamp(min=1.0)
+      _reg = 1e-3 * cheek_coef.pow(2).sum()
+      _jaw = jaw_outer_loss(_verts)
+      (_rgb * 30.0 + _reg + _jaw).backward()
+      copt.step()
+      with torch.no_grad():
+        cheek_coef.clamp_(-0.5, cheek_band)
+      if i == 0 or (i + 1) % max(cheek_iters // 6, 1) == 0 or i + 1 == cheek_iters:
+        print(f"  [cheek] {i+1:4d}/{cheek_iters}  rgb={float(_rgb):.5f}  "
+              f"jaw_out={float(_jaw):.4f}  coef={[round(float(c), 3) for c in cheek_coef]}", flush=True)
+    with torch.no_grad():
+      cheek_off = torch.einsum("k,kvi->vi", cheek_coef, cheek_dirs_t)
+      offset.add_(cheek_off)
+      stats["cheek_coef"] = cheek_coef.detach().cpu().numpy()
+      cheek_coef = None  # baked into offset; stop adding in world_verts
+      cheek_dirs_t = None
+    if dump_stage is not None:
+      dump_stage("7_cheek", "cheek modes photometric (frozen rest)", stage_bgr)
+
+  if cheek_coef is not None:
+    with torch.no_grad():
+      offset.add_(torch.einsum("k,kvi->vi", cheek_coef, cheek_dirs_t))
+      stats["cheek_coef"] = cheek_coef.detach().cpu().numpy()
+      cheek_coef = None
+      cheek_dirs_t = None
 
   with torch.no_grad():
     verts = world_verts().detach().cpu().numpy()
@@ -1155,7 +1284,7 @@ def _build_and_run(args) -> int:
     save_kw["semantic_coef"] = (photo["semantic_coef"] if photo.get("semantic_coef") is not None
                                 else np.asarray(args.semantic_coef, dtype=np.float32))
   np.savez(args.out_dir / "frame_photo_params.npz", **save_kw)
-  summary = {k: v for k, v in photo.items() if k not in ("photo_tex", "photo_all", "photo_offset", "semantic_coef", "static_offset_full")}
+  summary = {k: v for k, v in photo.items() if k not in ("photo_tex", "photo_all", "photo_offset", "semantic_coef", "static_offset_full", "cheek_coef")}
   summary["photo_tex"] = photo.get("photo_tex", {})
   summary["photo_all"] = photo.get("photo_all", {})
   summary["photo_offset"] = photo.get("photo_offset", {})
@@ -1188,7 +1317,21 @@ def main() -> int:
   p.add_argument("--expr_lr", type=float, default=5e-2,
                  help="expr lr in photo rgb_init_all stage (smaller = more stable).")
   p.add_argument("--photo_offset_iters", type=int, default=500)
-  p.add_argument("--stop_after", choices=("tex", "rgb", "offset"), default="tex")
+  p.add_argument("--stop_after", choices=("tex", "rgb", "offset", "cheek"), default="tex")
+  p.add_argument("--freeze_cam_neck", action="store_true",
+                 help="Freeze camera (focal/cam_aa/cam_t) and neck+head pose/translation in L1/L2; "
+                      "still optimize shape/expression/texture/lights. Keeps a fitted neck-shoulder fixed.")
+  p.add_argument("--l2_neck_anchor", action="store_true",
+                 help="在 L2(rgb) 阶段锚固颈/肩顶点（锚住 L2 起点世界位置），使 L2 不再把颈肩拧走；配合颈阶段静止输出实现“L2不动颈肩”。")
+  p.add_argument("--w_l2_neck_anchor", type=float, default=1.0,
+                 help="颈/肩锚固损失权重（mm^2 每顶点），越大颈肩越不动。")
+  p.add_argument("--cheek_modes", type=Path, default=None,
+                 help="npz with cheek_overall/cheek_upper/cheek_lower (mm); enables isolated cheek stage.")
+  p.add_argument("--cheek_iters", type=int, default=150)
+  p.add_argument("--cheek_lr", type=float, default=2e-2)
+  p.add_argument("--cheek_band", type=float, default=2.5)
+  p.add_argument("--cheek_init", type=str, default="1,0,0",
+                 help="Initial cheek (overall,upper,lower) coefficients when --cheek_modes given.")
   p.add_argument("--init_appearance", type=Path, default=None,
                  help="Load albedo and SH from a previous texture stage, then continue.")
   p.add_argument("--w_landmark", type=float, default=10.0)

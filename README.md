@@ -2,6 +2,9 @@
 
 单目流程。逐步说明见 [流程.md](流程.md)。第 0 帧的偏移 mesh 在 [mesh/frame_0000.obj](mesh/frame_0000.obj)。原先采用的第 0 帧仍是 `photo_contour_only`，跟踪结果在 `track_global/`。
 
+> **当前定稿主线**（见 [流程.md](流程.md)）：`rigid → lmk+眼 → 颈肩 trap-PCA(联合) → 耳(vertv3→系数) → 光度L1 → 光度L2`。
+> 一键运行：`GNM_Fit/pipeline_trap_reorder.sh`；出图（2 行 6 列定版）：`GNM_Fit/render_two_rows_reorder.py`。
+
 1. `GNM_Fit/fit_gnm.py`：刚体和形状，预设 `vhap_monocular`，3D 锚点 `head_sparse_68_v3_改.txt`。刚体各点权重一样。形状阶段鼻子 27–36 权重 10，下颌 0–16 权重 1。
 2. `photometric/flow_photo.py`：眼球只旋转，不平移。
 3. `photometric/flow_l1_vhap.py`：光度第一层，VHAP `rgb_init_texture`。输出 `photo_l1_vhap/`。
