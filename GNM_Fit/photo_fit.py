@@ -1288,7 +1288,6 @@ def _build_and_run(args) -> int:
         w0 = np.zeros(k_use, dtype=np.float32)
     state.expr_dirs = torch.as_tensor(dirs, dtype=torch.float32)
     state.expr_w = torch.tensor(w0, dtype=torch.float32, requires_grad=True)
-    args._expr_w0 = torch.tensor(w0, dtype=torch.float32)  # landmark anchor for all-stage reg
     state.ex_left.requires_grad_(False)
     state.ex_right.requires_grad_(False)
     state.ex_lower.requires_grad_(False)
@@ -1325,11 +1324,6 @@ def _build_and_run(args) -> int:
       reg = reg + args.reg_id * (id_coef ** 2).mean()
     if reg_ex:
       if state.expr_w is not None and state.expr_w.requires_grad:
-        # Anchor to landmark PCA init so all-stage photometry cannot inflate cheeks.
-        w0 = getattr(args, "_expr_w0", None)
-        if w0 is not None:
-          # Pull toward landmark PCA init (stops cheek/jaw inflation under photo loss).
-          reg = reg + float(getattr(args, "reg_ex_anchor", 1.0)) * ((state.expr_w - w0) ** 2).mean()
         reg = reg + args.reg_ex * (state.expr_w ** 2).mean()
       else:
         ex_parts = []
@@ -1473,12 +1467,6 @@ def main() -> int:
   p.add_argument("--nose_weight", type=float, default=10.0)
   p.add_argument("--reg_id", type=float, default=0.3)
   p.add_argument("--reg_ex", type=float, default=0.03)
-  p.add_argument(
-      "--reg_ex_anchor",
-      type=float,
-      default=1.0,
-      help="When PCA expr is on, weight of ||expr_w - w_landmark||^2 in photo stages.",
-  )
   p.add_argument(
       "--w_jaw_outer",
       type=float,
