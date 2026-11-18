@@ -952,7 +952,8 @@ def run_photometric(
             {"params": [lights], "lr": l2_light_lr},
             {"params": cam_params, "lr": 5e-3},
             {"params": expr_params, "lr": float(getattr(args, "expr_lr", 5e-2))},
-            {"params": pose_rot, "lr": 5e-3},
+            {"params": [state.rot_head], "lr": 5e-3},
+            {"params": [state.rot_neck], "lr": float(getattr(args, "neck_lr", 5e-3) if getattr(args, "neck_lr", None) is not None else 5e-3)},
             {"params": [state.translation], "lr": 1e-3},
             {"params": ([cheek_coef] if cheek_coef is not None else []),
              "lr": float(getattr(args, "cheek_lr", 2e-2))},
@@ -1497,6 +1498,9 @@ def main() -> int:
   p.add_argument("--l2_region_anchor_w", type=float, default=2000.0,
                  help="Weight of the L2 complement-region anchor (pins verts outside --l2_open_regions).")
   p.add_argument("--reg_joint", type=float, default=0.3)
+  p.add_argument("--neck_lr", type=float, default=None,
+                 help="L2 lr for the neck joint only (rot_neck). None = same as pose (5e-3); "
+                      "0 = effectively fixed; small (e.g. 1e-4) = tiny change. Head/cam/translation unaffected.")
   p.add_argument("--reg_jaw_yz", type=float, default=3.0)
   p.add_argument(
       "--expr_pca_dim",

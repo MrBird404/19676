@@ -50,9 +50,9 @@ $PY "$REPO/GNM_Fit/photo_fit.py" \
   --landmarks "$EV3/facepoints68.npz" --landmark_file "$REPO/GNM_Fit/head_sparse_68_v3_改.txt" \
   --image "$EV3/images/000001.jpg" \
   --stop_after tex --photo_tex_iters 500 --photo_tex_res 2048 --reg_tex_tv 5e3 \
-  --w_jaw_outer 20 --expr_pca_dim 0 --freeze_cam_neck --out_dir "$RUN/06_l1"
+  --w_jaw_outer 20 --expr_pca_dim 0 --freeze_cam_neck --freeze_shape --out_dir "$RUN/06_l1"
 
-echo "== 07 L2 (all, neck-anchored) =="
+echo "== 07 L2 (all, fully open, neck tiny lr) =="
 $PY "$REPO/GNM_Fit/photo_fit.py" \
   --params "$RUN/06_l1/frame_photo_params.npz" \
   --init_appearance "$RUN/06_l1/photo_appearance.npz" \
@@ -60,7 +60,7 @@ $PY "$REPO/GNM_Fit/photo_fit.py" \
   --image "$EV3/images/000001.jpg" \
   --stop_after rgb --photo_tex_iters 0 \
   --expr_pca "$RUN/02_lmk_eye/gnm_face_expr_pca150.npz" --expr_lr 2e-2 \
-  --l2_neck_anchor --freeze_cam_neck \
+  --neck_lr 1e-4 \
   --eye_centers "$EV3/flow_frame0/sam_eyes/centers.npz" --out_dir "$RUN/07_l2"
 
 echo "== stage npz =="
