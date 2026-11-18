@@ -26,7 +26,13 @@ sys.path.insert(0, str(HERE))
 import render_grid as rg  # noqa: E402
 
 EV3 = Path("/root/autodl-tmp/gnm_fit_out/expression_v3")
-RUN = Path(sys.argv[1]) if len(sys.argv) > 1 else EV3 / "pipeline_run_reorder"
+if any(a in ("-h", "--help") for a in sys.argv[1:]):
+    print(__doc__)
+    sys.exit(0)
+_args = [a for a in sys.argv[1:] if not a.startswith("-")]
+RUN = Path(_args[0]) if _args else EV3 / "pipeline_run_reorder"
+if not RUN.is_dir():
+    sys.exit(f"[render_two_rows] RUN dir not found: {RUN}  (refusing to write a broken figure)")
 OUT = Path(os.environ.get("RENDER_OUT", "/root/autodl-tmp/notes/gnm_uv/测试用图片/GNM v4 定版2行 reorder GT_rigid_lmkeye_neck_线_ear + L1_L2.jpg"))
 
 S = {"rigid": "01_rigid", "lmkeye": "02_lmk_eye", "neck": "03_neck_trapPCA",
