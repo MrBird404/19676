@@ -821,6 +821,7 @@ def run_photometric(
   off_iters = int(getattr(args, "photo_offset_iters", 500))
   stop_after = getattr(args, "stop_after", "tex")
   freeze_cam_neck = bool(getattr(args, "freeze_cam_neck", False))
+  freeze_shape = bool(getattr(args, "freeze_shape", False))
   lmk_w = float(getattr(args, "w_landmark", 10.0))
   # Eyeball joints stay at the pre-photo rotation.
   state.rot_leye.requires_grad_(False)
@@ -828,7 +829,7 @@ def run_photometric(
 
   shape_params = [state.id_head, state.id_eyes]
   cam_params = [state.cam_aa, state.cam_t, state.focal_norm]
-  for t in shape_params + cam_params:
+  for t in ([] if freeze_shape else shape_params) + cam_params:
     t.requires_grad_(True)
   if freeze_cam_neck:
     for t in cam_params:
@@ -883,7 +884,7 @@ def run_photometric(
         f"tex(lr={l2_tex_lr:g})+lights(lr={l2_light_lr:g}); eye joints fixed",
         flush=True,
     )
-    for t in shape_params + ([] if freeze_cam_neck else pose_rot) + ([] if freeze_cam_neck else [state.translation]) + expr_params:
+    for t in ([] if freeze_shape else shape_params) + ([] if freeze_cam_neck else pose_rot) + ([] if freeze_cam_neck else [state.translation]) + expr_params:
       t.requires_grad_(True)
     if freeze_cam_neck:
       for t in pose_rot + [state.translation]:
@@ -932,6 +933,56 @@ def run_photometric(
       with torch.no_grad():
         cheek_coef.clamp_(cheek_lo, cheek_hi)
       print(f"[photo] cheek coef after all={[round(float(c), 3) for c in cheek_coef]}", flush=True)
+
+    if (stop_after == "rgb" and getattr(args, "eye_centers", None)
+        and Path(args.eye_centers).is_file()):
+      from nvdiffrast_render.camera import project_world_to_pixels as _pw2p
+      _c = np.load(args.eye_centers, allow_pickle=True)
+      _centers = np.asarray(_c["centers"], dtype=np.float32)
+      _fi = int(getattr(args, "eye_frame", 0))
+      _eids = [int(x) for x in str(getattr(args, "eye_verts", "17303,17689")).split(",") if x.strip()]
+      if 0 <= _fi < _centers.shape[0] and len(_eids) == 2:
+        _tgt_np = _centers[_fi]
+        _euv = torch.as_tensor(_eids, dtype=torch.long)
+        # Only the eye joints move: freeze identity (id_head/id_eyes), pose, camera, offset, expr.
+        for _t in (state.id_head, state.id_eyes, state.ex_lower, state.rot_neck, state.rot_head,
+                   state.translation, state.cam_aa, state.cam_t, state.focal_norm, offset):
+          _t.requires_grad_(False)
+        for _t in (getattr(state, "ex_left", None), getattr(state, "ex_right", None),
+                   getattr(state, "expr_w", None)):
+          if _t is not None:
+            _t.requires_grad_(False)
+        _al = state.rot_leye.detach().clone(); _ar = state.rot_reye.detach().clone()
+        state.rot_leye = torch.nn.Parameter(_al.clone())
+        state.rot_reye = torch.nn.Parameter(_ar.clone())
+        _wav = float(getattr(args, "w_eye_anchor", 40.0))
+        _opt = torch.optim.Adam([state.rot_leye, state.rot_reye], lr=float(getattr(args, "eye_lr", 2e-2)))
+
+        def _proj(vv):
+          return _pw2p(vv, state.camera_rt(), state.camera_k(width, height), width, height, flip_y=True)
+
+        with torch.no_grad():
+          _p0 = _proj(world_verts()[_euv])
+          _order = torch.argsort(_p0[:, 0])
+          _sc = _tgt_np[np.argsort(_tgt_np[:, 0])]  # image-left center ↔ more-left projected eye
+          _tgt = torch.zeros(2, 2, dtype=torch.float32)
+          _tgt[_order] = torch.as_tensor(_sc, dtype=torch.float32)
+          _e0 = torch.linalg.norm(_p0 - _tgt, dim=-1)
+        for _ in range(max(int(getattr(args, "eye_iters", 60)), 1)):
+          _opt.zero_grad()
+          _pred = _proj(world_verts()[_euv])
+          _loss = (_pred - _tgt).pow(2).sum() + _wav * (
+              (state.rot_leye - _al).pow(2).sum() + (state.rot_reye - _ar).pow(2).sum())
+          _loss.backward(); _opt.step()
+        with torch.no_grad():
+          _pred = _proj(world_verts()[_euv])
+          _err = torch.linalg.norm(_pred - _tgt, dim=-1)
+        print(f"[eye_centers] rotate eye joints only  err {float(_e0[0]):.2f}/{float(_e0[1]):.2f} -> "
+              f"{float(_err[0]):.2f}/{float(_err[1]):.2f}px  target={_tgt.detach().cpu().numpy().round(1).tolist()}",
+              flush=True)
+        stats["eye_center_err_px"] = [float(_err[0]), float(_err[1])]
+        state.rot_leye = state.rot_leye.detach()
+        state.rot_reye = state.rot_reye.detach()
 
   neck_anchor_enabled = False   # 颈/肩锚固只作用于 L2，不遗留到 offset/cheek 阶段
 
@@ -1321,6 +1372,20 @@ def main() -> int:
   p.add_argument("--freeze_cam_neck", action="store_true",
                  help="Freeze camera (focal/cam_aa/cam_t) and neck+head pose/translation in L1/L2; "
                       "still optimize shape/expression/texture/lights. Keeps a fitted neck-shoulder fixed.")
+  p.add_argument("--freeze_shape", action="store_true",
+                 help="L1/L2: freeze identity shape (id_head,id_eyes). Pair with --eye_centers so the "
+                      "eyeball position/orientation stays fixed while tex/light/expr are refined.")
+  p.add_argument("--eye_centers", type=Path, default=None,
+                 help="SAM pupil centers npz (centers[T,2,2]). At the end of L2, rotate ONLY the eye "
+                      "joints (rot_leye/rot_reye) to match these 2D centers; id/id_eyes are untouched.")
+  p.add_argument("--eye_verts", type=str, default="17303,17689",
+                 help="Two GNM vertex ids used as pupil proxies for --eye_centers.")
+  p.add_argument("--eye_frame", type=int, default=0)
+  p.add_argument("--eye_iters", type=int, default=60)
+  p.add_argument("--eye_lr", type=float, default=2e-2)
+  p.add_argument("--w_eye_anchor", type=float, default=40.0,
+                 help="Anchor the eye joints to their pre-eye-fit value (gaze spin is unobservable "
+                      "from one point; keep near the current gaze).")
   p.add_argument("--l2_neck_anchor", action="store_true",
                  help="在 L2(rgb) 阶段锚固颈/肩顶点（锚住 L2 起点世界位置），使 L2 不再把颈肩拧走；配合颈阶段静止输出实现“L2不动颈肩”。")
   p.add_argument("--w_l2_neck_anchor", type=float, default=1.0,
