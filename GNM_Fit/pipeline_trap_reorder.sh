@@ -63,6 +63,19 @@ $PY "$REPO/GNM_Fit/photo_fit.py" \
   --neck_lr 1e-4 \
   --eye_centers "$EV3/flow_frame0/sam_eyes/centers.npz" --out_dir "$RUN/07_l2"
 
+echo "== 08 eye (眼球专属: L1 眼色/眼白 + L2 SAM3 瞳孔半径 r; rot_leye/reye 不动, 无静态偏移) =="
+mkdir -p "$RUN/08_eye"
+$PY "$REPO/GNM_Fit/photo_fit.py" \
+  --params "$RUN/07_l2/frame_photo_params.npz" \
+  --init_appearance "$RUN/07_l2/photo_appearance.npz" \
+  --landmarks "$EV3/facepoints68.npz" --landmark_file "$REPO/GNM_Fit/head_sparse_68_v3_改.txt" \
+  --image "$EV3/images/000001.jpg" \
+  --stop_after eye --photo_tex_iters 0 \
+  --expr_pca "$RUN/02_lmk_eye/gnm_face_expr_pca150.npz" \
+  --eye_tex_iters 200 --eye_pupil_iters 0 --eye_opt_id 1 \
+  --eye_pupil_mask "$EV3/flow_frame0/photo/eye_mask.npz" \
+  --out_dir "$RUN/08_eye"
+
 echo "== stage npz =="
 find "$RUN" -maxdepth 2 -name 'frame_*_params.npz' | sort
 echo "DONE"

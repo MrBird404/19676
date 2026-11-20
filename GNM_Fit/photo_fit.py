@@ -535,6 +535,55 @@ def run_photometric(
     y0, x0 = row * tile, col * tile
     fixed[0, :, y0:y0 + tile, x0:x0 + tile] = sheet
   fixed_atlas = torch.as_tensor(fixed, device=device)
+  # Eye-region texture residual (learned only in the eye-only stage). Starts at 0
+  # so skin L1/L2 render identically to the authored eye sheets (frozen at 0).
+  eye_tex_res = {
+      nm: torch.nn.Parameter(torch.zeros(1, 3, tile, tile, dtype=torch.float32, device=device))
+      for nm in ("eye_left", "eye_right")
+  }
+  # Controllable pupil size, drawn INSIDE each eye tile at the true pupil center
+  # (detected from the authored eye sheet's central dark blob, ignoring the black
+  # border). r is tile-local UV; the disk is pasted into the eye tile so it paints
+  # the eye, never the face.
+  def _detect_pupil_tile(name):
+    S = min(int(tile), 256)
+    rgb = _sheet_rgb(name, S)
+    lum = rgb.mean(-1)
+    yy, xx = np.mgrid[0:S, 0:S]
+    u = (xx + 0.5) / S
+    v = (yy + 0.5) / S
+    central = (u > 0.3) & (u < 0.7) & (v > 0.3) & (v < 0.7)
+    dark = ((lum < 0.28) & central).astype(np.uint8)
+    num, lb, st, cen = cv2.connectedComponentsWithStats(dark, 8)
+    if num <= 1:
+      return (0.5, 0.5), 0.04
+    _i = 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))
+    cx, cy = cen[_i]
+    r = float(np.sqrt(st[_i, cv2.CC_STAT_AREA] / np.pi) / S)
+    return (float(cx / S), float(cy / S)), float(np.clip(r, 0.02, 0.12))
+
+  pupil_tc = {}
+  pupil_r0 = {}
+  for _nm in ("eye_left", "eye_right"):
+    _c, _r = _detect_pupil_tile(_nm)
+    pupil_tc[_nm] = _c
+    pupil_r0[_nm] = _r
+    print(f"[photo] pupil tile {_nm} center=({_c[0]:.3f},{_c[1]:.3f}) r0={_r:.4f}", flush=True)
+  pupil_r = {
+      _nm: torch.nn.Parameter(torch.tensor(pupil_r0[_nm], dtype=torch.float32, device=device),
+                              requires_grad=False)
+      for _nm in ("eye_left", "eye_right")
+  }
+  pupil_draw_active = False
+  _pupil_color = torch.tensor([0.20, 0.19, 0.20], dtype=torch.float32, device=device).view(1, 3, 1, 1)
+  _pupil_soft = 1.5 / float(tile)  # soft edge in tile-local uv
+  _pup_axis = (torch.arange(tile, device=device, dtype=torch.float32) + 0.5) / tile
+  _PU, _PV = torch.meshgrid(_pup_axis, _pup_axis, indexing="xy")  # (tile,tile)
+  pupil_dist = {
+      _nm: torch.sqrt((_PU - pupil_tc[_nm][0]) ** 2 + (_PV - pupil_tc[_nm][1]) ** 2)
+      for _nm in ("eye_left", "eye_right")
+  }
+  _pup_ids = _group_ids(gnm_np, "pupils")
   # VHAP lights_uniform: band0 = sqrt(4*pi), rest 0.
   lights_uniform = torch.zeros(1, 9, 3, dtype=torch.float32, device=device)
   lights_uniform[:, 0, :] = float(np.sqrt(4.0 * np.pi))
@@ -639,6 +688,19 @@ def run_photometric(
         raise ValueError(f"saved residual/albedo {res.shape} does not match skin tile {tile}")
       tex_res.copy_(torch.as_tensor(res, device=tex_res.device))
       lights.copy_(torch.as_tensor(saved["lights"].astype(np.float32), device=lights.device))
+      for _nm in ("eye_left", "eye_right"):
+        _key = "eye_residual_" + _nm.split("_")[1]
+        if _key in saved.files:
+          _er = np.asarray(saved[_key], dtype=np.float32)
+          if _er.ndim == 3:
+            _er = _er[None]
+          eye_tex_res[_nm].copy_(torch.as_tensor(_er, device=eye_tex_res[_nm].device))
+          print(f"[photo] loaded {_key} norm={float(np.linalg.norm(_er)):.4f}", flush=True)
+      for _s in list(pupil_r):
+        _pk = f"pupil_r_{_s}"
+        if _pk in saved.files:
+          pupil_r[_s].copy_(torch.tensor(float(saved[_pk]), device=pupil_r[_s].device))
+          print(f"[photo] loaded {_pk}={float(saved[_pk]):.5f}", flush=True)
       print(f"[photo] loaded residual+SH from {init_appearance}", flush=True)
 
   stats: dict = {"photo_size": [pw, ph], "photo_scale": scale}
@@ -660,6 +722,16 @@ def run_photometric(
     atlas = fixed_atlas.clone()
     y0, x0 = _TILES["skin"][1] * tile, _TILES["skin"][0] * tile
     atlas[:, :, y0:y0 + tile, x0:x0 + tile] = skin_albedo()
+    for nm, res in eye_tex_res.items():
+      yy, xx = _TILES[nm][1] * tile, _TILES[nm][0] * tile
+      base = fixed_atlas[:, :, yy:yy + tile, xx:xx + tile]
+      atlas[:, :, yy:yy + tile, xx:xx + tile] = (base + res).clamp(1e-4, 1.0 - 1e-4)
+    if pupil_draw_active:
+      for _nm, _r in pupil_r.items():
+        _yy, _xx = _TILES[_nm][1] * tile, _TILES[_nm][0] * tile
+        _m = torch.clamp((_r - pupil_dist[_nm]) / _pupil_soft, 0.0, 1.0)[None, None]
+        _sub = atlas[:, :, _yy:_yy + tile, _xx:_xx + tile]
+        atlas[:, :, _yy:_yy + tile, _xx:_xx + tile] = _sub * (1.0 - _m) + _pupil_color * _m
     return atlas
 
   def render_pack(disturb: bool, bound_ids: torch.Tensor):
@@ -1036,6 +1108,345 @@ def run_photometric(
 
   neck_anchor_enabled = False   # 颈/肩锚固只作用于 L2，不遗留到 offset/cheek 阶段
 
+  if stop_after == "eye":
+    # Eye-only photometric stage (after skin L2). Everything frozen except the
+    # eye-region texture, id_eyes, lights (optional) and the pupil dim.
+    # rot_leye/reye are NEVER touched here (fixed at the end of L2).
+    for _t in (
+        state.id_head, state.ex_lower, state.rot_neck, state.rot_head,
+        state.rot_leye, state.rot_reye, state.translation,
+        state.cam_aa, state.cam_t, state.focal_norm, offset, tex_res, lights,
+        state.ex_left, state.ex_right,
+    ):
+      _t.requires_grad_(False)
+    if state.expr_w is not None:
+      state.expr_w.requires_grad_(False)
+    if getattr(state, "pupil", None) is not None:
+      state.pupil.requires_grad_(False)
+    for _r in eye_tex_res.values():
+      _r.requires_grad_(False)
+    _opt_id = bool(getattr(args, "eye_opt_id", True))
+    _opt_light = bool(getattr(args, "eye_opt_lights", False))
+    e1 = int(getattr(args, "eye_tex_iters", 200))
+    e2 = int(getattr(args, "eye_pupil_iters", 120))
+    lr_tex = float(getattr(args, "eye_tex_lr", 5e-3))
+    lr_pupil = float(getattr(args, "eye_pupil_lr", 5e-2))
+    print(f"[photo] eye stage  L1(eye tex, id?{_opt_id}, light?{_opt_light}) iters={e1}  "
+          f"L2(pupil r, id?{_opt_id}) iters={e2}  (rot_leye/reye frozen)", flush=True)
+    pupil_draw_active = bool(pupil_r)   # draw the controllable pupil disk
+    for _r in pupil_r.values():
+      _r.requires_grad_(False)
+    # --- Eye L1: eye-region color (texture residual) ---
+    for _r in eye_tex_res.values():
+      _r.requires_grad_(True)
+    groups1 = [{"params": list(eye_tex_res.values()), "lr": lr_tex}]
+    if _opt_id:
+      state.id_eyes.requires_grad_(True)
+      groups1.append({"params": [state.id_eyes], "lr": 5e-3})
+    if _opt_light:
+      lights.requires_grad_(True)
+      groups1.append({"params": [lights], "lr": 5e-3})
+    log_e1 = run_loop("eye_l1", e1, groups1, w_rgb=30.0, w_lmk_term=lmk_w,
+                      disturb=True, use_offset_reg=False, bound_ids=bound_later)
+    for _r in eye_tex_res.values():
+      _r.requires_grad_(False)
+    if _opt_light:
+      lights.requires_grad_(False)
+    # --- Eye L2: controllable pupil radius r from SAM3 pupil radius (tile-local) ---
+    # r is the disk radius inside the eye tile. Scale a = px-per-tile-uv from the
+    # eye-tile faces near the pupil center; r = R_sam / a.
+    log_e2 = {}
+    _pr_npz = getattr(args, "eye_pupil_radius_npz", None)
+    _pm_npz = getattr(args, "eye_pupil_mask", None)
+    _radii = None
+    _scen = None
+    if _pm_npz is not None and Path(str(_pm_npz)).exists():
+      _mk = (np.load(str(_pm_npz))["mask"] > 0).astype(np.uint8)
+      _numc, _labels, _stats, _ = cv2.connectedComponentsWithStats(_mk, 8)
+      _circ = []
+      for _i in range(1, _numc):
+        if int(_stats[_i, cv2.CC_STAT_AREA]) < 40:
+          continue
+        _ys, _xs = np.nonzero(_labels == _i)
+        (_cx0, _cy0), _rr0 = cv2.minEnclosingCircle(np.stack([_xs, _ys], 1).astype(np.float32))
+        _circ.append((_rr0, _cx0, _cy0))
+      _circ.sort(reverse=True)
+      if len(_circ) >= 2:
+        _radii = np.array([_circ[0][0], _circ[1][0]], np.float32)
+        _scen = np.array([[_circ[0][1], _circ[0][2]], [_circ[1][1], _circ[1][2]]], np.float32)
+        print(f"[photo] pupil circles from mask {_pm_npz}  R={_radii.tolist()}", flush=True)
+    if _radii is None and _pr_npz is not None and Path(str(_pr_npz)).exists():
+      _z = np.load(str(_pr_npz))
+      _radii = np.asarray(_z["radii"], np.float32).reshape(-1)
+      _scen = np.asarray(_z["centers"], np.float32).reshape(-1, 2)
+    if _radii is not None:
+      _material = material_ids(gnm_np, faces)
+      _wv = world_verts().detach()
+      # per-tile: projected center (image px) + assigned SAM pupil radius
+      _tinfo = {}
+      iris_r = {}
+      for _nm in ("eye_left", "eye_right"):
+        _ti = _TILE_NAMES.index(_nm)
+        _fsel = np.nonzero(_material == _ti)[0]
+        if _fsel.size == 0:
+          continue
+        _vv = np.unique(faces[_fsel].reshape(-1))
+        _ppx = project_xy(_wv[torch.as_tensor(_vv, dtype=torch.long)]).detach().cpu().numpy()
+        _pc = _ppx.mean(0)
+        _best = None
+        for _j in range(min(_scen.shape[0], _radii.shape[0])):
+          _dd = float(np.linalg.norm(_pc - _scen[_j]))
+          if _best is None or _dd < _best[0]:
+            _best = (_dd, _j)
+        _tinfo[_nm] = (np.asarray(_pc, np.float64), float(_radii[_best[1]]),
+                       np.asarray(_scen[_best[1]], np.float64).copy())
+      # --- GEOMETRY: size iris/pupil by the expression 'pupil' dim so the geometric
+      # iris radius matches the SAM/photo iris radius (pure vertex projection; this
+      # dim only radially scales iris/pupil verts and never moves the eye joints). ---
+      try:
+        _Iset = _group_ids(gnm_np, "irises")
+        _Lset = set(_group_ids(gnm_np, "left_eye").tolist())
+        _Rset = set(_group_ids(gnm_np, "right_eye").tolist())
+        _I_L = np.asarray([i for i in _Iset if i in _Lset], np.int64)
+        _I_R = np.asarray([i for i in _Iset if i in _Rset], np.int64)
+        _tL = torch.as_tensor(_I_L, dtype=torch.long)
+        _tR = torch.as_tensor(_I_R, dtype=torch.long)
+        _sL = np.asarray(_tinfo["eye_left"][2], np.float64)
+        _sR = np.asarray(_tinfo["eye_right"][2], np.float64)
+        _RL = float(_tinfo["eye_left"][1])
+        _RR = float(_tinfo["eye_right"][1])
+
+        def _iris_px(cval):
+          with torch.no_grad():
+            state.pupil.fill_(float(cval))
+          _w = world_verts()
+          _pL = project_xy(_w[_tL]).detach().cpu().numpy()
+          _pR = project_xy(_w[_tR]).detach().cpu().numpy()
+          return np.array([np.linalg.norm(_pL - _sL, axis=1).mean(),
+                           np.linalg.norm(_pR - _sR, axis=1).mean()])
+
+        _r0 = _iris_px(0.0)
+        _r1 = _iris_px(1.0)
+        _den = _r1 - _r0
+        _den[np.abs(_den) < 1e-6] = 1e-6
+        _cstar = float(np.clip(np.mean((np.array([_RL, _RR]) - _r0) / _den), -3.0, 3.0))
+        with torch.no_grad():
+          state.pupil.fill_(_cstar)
+        _rfin = _iris_px(_cstar)
+        print("[photo] geo iris  r@c0=%s r@c1=%s SAM=%s -> c=%.3f  r_final=%s px"
+              % (np.round(_r0, 2), np.round(_r1, 2), np.round([_RL, _RR], 2),
+                 _cstar, np.round(_rfin, 2)), flush=True)
+        log_e2["geo_pupil_c"] = _cstar
+        log_e2["geo_iris_px"] = [float(_rfin[0]), float(_rfin[1])]
+      except Exception as _e:
+        print(f"[photo] geo iris calib skipped: {_e}", flush=True)
+      # Calibrate px-per-tile-uv with a red-marker render (disk painted pure red so
+      # it is separable from sclera/skin), then r = R_sam / a.
+      _rcal = 0.06
+      _win = 22
+      _red = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32, device=device).view(1, 3, 1, 1)
+      _orig_color = _pupil_color
+      with torch.no_grad():
+        _pupil_color = _red
+        for _nm in _tinfo:
+          pupil_r[_nm].copy_(torch.tensor(_rcal, device=pupil_r[_nm].device))
+        _v, _rast, _out = render_pack(False, bound_later)
+        _predm = _out["rgba"][..., :3][0].detach()
+        _Hp, _Wp = _predm.shape[0], _predm.shape[1]
+        for _nm, (_pc, _R, _sc) in _tinfo.items():
+          _cx = int(round(float(_pc[0]) * scale))
+          _cy = int(round(float(_pc[1]) * scale))
+          _y0, _y1 = max(_cy - _win, 0), min(_cy + _win, _Hp)
+          _x0, _x1 = max(_cx - _win, 0), min(_cx + _win, _Wp)
+          _sub = _predm[_y0:_y1, _x0:_x1]
+          _score = _sub[..., 0] - 0.5 * (_sub[..., 1] + _sub[..., 2])
+          _area = float((_score > 0.5).sum())
+          _rpx = float(max(_area, 1.0) / np.pi) ** 0.5
+          _a = _rpx / _rcal
+          # SAM "pupil" R ~= iris outer radius (it segments the whole dark iris+pupil
+          # disk), NOT the pupil core. Iris radius = R/a. Pupil radius uses the true
+          # photo pupil core, capped by max = 0.6 * iris radius so it never covers
+          # the whole iris.
+          _r_iris = _R / max(_a, 1e-6)
+          iris_r[_nm] = float(_r_iris)
+          _r_pu_max = 0.6 * _r_iris
+          _r_new = float(min(pupil_r0[_nm], _r_pu_max))
+          pupil_r[_nm].copy_(torch.tensor(_r_new, device=pupil_r[_nm].device))
+          print(f"[photo] pupil tile {_nm} SAM R={_R:.2f}px -> iris r={_r_iris:.4f} "
+                f"pupil r={_r_new:.4f} (max {_r_pu_max:.4f})", flush=True)
+          log_e2[_nm] = {"sam_R_px": _R, "iris_r_tile": float(_r_iris),
+                         "pupil_r_tile": _r_new, "pupil_r_max": float(_r_pu_max)}
+        _pupil_color = _orig_color
+      with torch.no_grad():
+        _v, _rast, _out = render_pack(False, bound_later)
+        _predrgba = _out["rgba"][0].detach().float().cpu().numpy()
+      dump_photo_preview(args.out_dir, "eye_l2", rgb_np, _predrgba)
+      # Eye-only render: keep only eyeball+sclera cluster pixels (sclerae=7,
+      # irises=8) from the full render, everything else white.
+      try:
+        with torch.no_grad():
+          _rid = _rast["rast_out"][0, :, :, 3].long()            # triangle id (+1, 0=bg)
+          _mid = torch.as_tensor(material_ids(gnm_np, faces), dtype=torch.long,
+                                 device=_rid.device)             # material tile per face
+          _eye_tiles = torch.tensor(
+              [_TILE_NAMES.index("eye_left"), _TILE_NAMES.index("eye_right")],
+              dtype=torch.long, device=_rid.device)
+          _fidx = (_rid - 1).clamp(min=0)
+          _pix_tile = _mid[_fidx]
+          _eye_mask = (torch.isin(_pix_tile, _eye_tiles) & (_rid > 0)).cpu().numpy()[::-1]
+        _eo_rgb = _predrgba[..., :3].copy()
+        _eo_rgb[~_eye_mask] = 1.0
+        cv2.imwrite(str(args.out_dir / "stage_eye_only_render.png"),
+                    np.clip(_eo_rgb[..., ::-1] * 255.0, 0, 255).astype(np.uint8))
+        print(f"  [dump] stage_eye_only_render.png  (eye px={int(_eye_mask.sum())})", flush=True)
+      except Exception as _e:
+        print(f"[photo] eye-only render skipped: {_e}", flush=True)
+      # ---- Full eyeball texture: fill the eye-tile black padding with sclera via
+      # a radial color profile from the visible island (keep fitted island, redraw
+      # pupil r), then render the eyeball-only mesh from front / side / back. ----
+      try:
+        _atlas = skin_atlas().detach()
+        _atlas_full = _atlas.clone()
+        _u = _PU.detach().cpu().numpy()
+        _v = _PV.detach().cpu().numpy()
+        # ---- bake_delight: back-project GT eye pixels into the eye tiles (divide
+        # out the rendered diffuse -> albedo), then fill unseen texels by radius
+        # robust average (discarding bright outliers such as catch-light). ----
+        import nvdiffrast.torch as dr
+        _Hp = int(_rast["rast_out"].shape[1])
+        _Wp2 = int(_rast["rast_out"].shape[2])
+        with torch.no_grad():
+          _texc, _ = dr.interpolate(verts_uv_t[None], _rast["rast_out"], faces_uv_t,
+                                    rast_db=_rast["rast_out_db"], diff_attrs='all')
+        _texc = _texc[0].detach().cpu().numpy()[::-1]              # -> image space (row0=top)
+        _diff = _out["diffuse"][0].detach().cpu().numpy()          # image space (row0=top)
+        _rid = _rast["rast_out"][0, :, :, 3].long()
+        _mid = torch.as_tensor(material_ids(gnm_np, faces), dtype=torch.long, device=_rid.device)
+        _et = torch.tensor([_TILE_NAMES.index("eye_left"), _TILE_NAMES.index("eye_right")],
+                           dtype=torch.long, device=_rid.device)
+        _pix_tile = _mid[(_rid - 1).clamp(min=0)]
+        _vis = (torch.isin(_pix_tile, _et) & (_rid > 0)).cpu().numpy()[::-1]  # image space
+        _cimg = cv2.imread(str(args.image), cv2.IMREAD_COLOR)
+        _img = cv2.cvtColor(_cimg, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        _H0, _W0 = _img.shape[:2]
+        _AH, _AW = int(_atlas_full.shape[2]), int(_atlas_full.shape[3])
+        _ys, _xs = np.nonzero(_vis)
+        _gy = np.clip((_ys * (_H0 / _Hp)).astype(int), 0, _H0 - 1)
+        _gx = np.clip((_xs * (_W0 / _Wp2)).astype(int), 0, _W0 - 1)
+        _gtc = _img[_gy, _gx]                                      # GT color per eye pixel
+        _sh = np.maximum(_diff[_ys, _xs], 0.25)                    # de-light shading
+        _alb = np.clip(_gtc / _sh, 0.0, 1.0)                       # albedo = GT / diffuse
+        _au = np.clip(_texc[_ys, _xs, 0], 0.0, 1.0)
+        _av = np.clip(_texc[_ys, _xs, 1], 0.0, 1.0)
+        _ax = np.clip((_au * _AW).astype(int), 0, _AW - 1)
+        _ay = np.clip((_av * _AH).astype(int), 0, _AH - 1)
+        _sum = np.zeros((_AH, _AW, 3), np.float32)
+        _cnt = np.zeros((_AH, _AW), np.float32)
+        np.add.at(_sum, (_ay, _ax), _alb)
+        np.add.at(_cnt, (_ay, _ax), 1.0)
+        _baked = _sum / np.maximum(_cnt, 1.0)[..., None]           # de-lit albedo per texel
+        _u = _PU.detach().cpu().numpy()
+        _v = _PV.detach().cpu().numpy()
+        _nb = 64
+        for _nm in ("eye_left", "eye_right"):
+          _yy, _xx = _TILES[_nm][1] * tile, _TILES[_nm][0] * tile
+          _bk = _baked[_yy:_yy + tile, _xx:_xx + tile, :]
+          _ct = _cnt[_yy:_yy + tile, _xx:_xx + tile]
+          _valid = _ct >= 1.0
+          _cu, _cv = pupil_tc[_nm]
+          _rho = np.sqrt((_u - _cu) ** 2 + (_v - _cv) ** 2)
+          _rmax = float(_rho.max())
+          _bin = np.clip((_rho / _rmax * _nb).astype(np.int64), 0, _nb - 1)
+          _lum = _bk.mean(-1)
+          _prof = np.zeros((_nb, 3), np.float32)
+          for _bi in range(_nb):
+            _mb = _valid & (_bin == _bi)
+            if not _mb.any():
+              _prof[_bi] = _prof[_bi - 1] if _bi > 0 else np.array([0.6, 0.6, 0.6], np.float32)
+              continue
+            _ls = _lum[_mb]
+            _med = float(np.median(_ls))
+            _cc = _bk[_mb][_ls < _med + 0.20]                      # drop catch-light outliers
+            _prof[_bi] = _cc.mean(0) if _cc.size else _bk[_mb].mean(0)
+          _newsub = np.where(_valid[..., None], _bk, _prof[_bin])  # unseen→radius avg
+          _new_t = torch.as_tensor(_newsub, device=_atlas.device,
+                                   dtype=_atlas_full.dtype).permute(2, 0, 1)[None]
+          _atlas_full[:, :, _yy:_yy + tile, _xx:_xx + tile] = _new_t
+        _ex0 = _TILES["eye_left"][0] * tile
+        _snip = _atlas_full[:, :, 0:tile, _ex0:_ex0 + tile]
+        cv2.imwrite(str(args.out_dir / "stage_eye_tile_filled.png"),
+                    np.clip(_snip[0].permute(1, 2, 0).cpu().numpy()[..., ::-1] * 255, 0, 255).astype(np.uint8))
+        # ---- eyeball-only mesh (front/side/back) ----
+        _mat = material_ids(gnm_np, faces)
+        _eye_fid = np.nonzero(np.isin(_mat, [_TILE_NAMES.index("eye_left"),
+                                             _TILE_NAMES.index("eye_right")]))[0]
+        _vw = world_verts().detach()
+        _faces_e = torch.as_tensor(faces[_eye_fid], dtype=torch.long).to(device)
+        _facesuv_e = torch.as_tensor(faces_uv[_eye_fid], dtype=torch.long).to(device)
+        _cen = {}
+        for _nm in ("eye_left", "eye_right"):
+          _ti = _TILE_NAMES.index(_nm)
+          _f = np.nonzero(_mat == _ti)[0]
+          _vvn = np.unique(faces[_f].reshape(-1))
+          _cen[_nm] = (_vvn, _vw[torch.as_tensor(_vvn, dtype=torch.long)].mean(0).detach().cpu().numpy())
+
+        def _render_eye(deg):
+          _vr = _vw.clone()
+          ang = np.deg2rad(deg)
+          ca, sa = np.cos(ang), np.sin(ang)
+          for _nm, (_vid, _c) in _cen.items():
+            _p = _vr[torch.as_tensor(_vid, dtype=torch.long)].cpu().numpy() - _c
+            _x = ca * _p[:, 0] + sa * _p[:, 2]
+            _z = -sa * _p[:, 0] + ca * _p[:, 2]
+            _p2 = np.stack([_x, _p[:, 1], _z], 1) + _c
+            _vr[torch.as_tensor(_vid, dtype=torch.long)] = torch.as_tensor(
+                _p2, dtype=_vr.dtype, device=_vr.device)
+          with torch.no_grad():
+            _vg = _vr.to(device)[None].contiguous()
+            _rt = state.camera_rt().to(device)[None]
+            _rast_e = renderer.rasterize(_vg, _faces_e, _rt, k_t, (ph, pw),
+                                         use_cache=False, require_grad=False)
+            _out_e = renderer.render_rgba(
+                _rast_e, _vg[0], _faces_e, verts_uv_t, _facesuv_e, _atlas_full,
+                lights.to(device), background_color=[1.0, 1.0, 1.0],
+                align_texture_except_fid=None, align_boundary_except_vid=None,
+                enable_disturbance=False)
+            _rgb = _out_e["rgba"][0, ..., :3].detach().float().cpu().numpy()
+          return _rgb
+
+        # Whole-head display lift -- dialed back one notch (was 0.90*1.05).
+        def _tone(x):
+          return np.clip(np.clip(x, 0.0, 1.0) ** 0.94 * 1.02, 0.0, 1.0)
+
+        for _deg, _tag in [(0, "front"), (60, "side"), (120, "back")]:
+          _rgb = _render_eye(_deg)   # raw (no lift): eyeball color matches GT
+          cv2.imwrite(str(args.out_dir / f"stage_eyeball_{_tag}.png"),
+                      np.clip(_rgb[..., ::-1] * 255, 0, 255).astype(np.uint8))
+        # ---- full head rendered with the baked (photo-colored) eye texture ----
+        with torch.no_grad():
+          _vgF = _vw.to(device)[None].contiguous()
+          _rtF = state.camera_rt().to(device)[None]
+          _rastF = renderer.rasterize(_vgF, faces_t, _rtF, k_t, (ph, pw),
+                                      use_cache=False, require_grad=False)
+          _outF = renderer.render_rgba(
+              _rastF, _vgF[0], faces_t, verts_uv_t, faces_uv_t, _atlas_full,
+              lights.to(device), background_color=[1.0, 1.0, 1.0],
+              align_texture_except_fid=None, align_boundary_except_vid=None,
+              enable_disturbance=False)
+          _rgbF = _outF["rgba"][0, ..., :3].detach().float().cpu().numpy()
+        _rgbF = _tone(_rgbF)
+        cv2.imwrite(str(args.out_dir / "stage_full_baked.png"),
+                    np.clip(_rgbF[..., ::-1] * 255, 0, 255).astype(np.uint8))
+        print("  [dump] stage_eyeball_{front,side,back}.png + stage_eye_tile_filled.png + stage_full_baked.png", flush=True)
+      except Exception as _e:
+        print(f"[photo] eyeball fill/render skipped: {_e}", flush=True)
+    else:
+      print("[photo] eye_l2 skipped (no --eye_pupil_radius_npz or no pupil verts)", flush=True)
+    for _r in pupil_r.values():
+      _r.requires_grad_(False)
+    stats["eye_l1"] = log_e1
+    stats["eye_l2"] = log_e2
+
   if stop_after == "offset":
     print("[photo] rgb_init_offset  static offset, teeth/eyes/scalp/ears pinned", flush=True)
     tex_res.requires_grad_(True)
@@ -1146,6 +1557,9 @@ def run_photometric(
       lights=lights.detach().cpu().numpy(),
       static_offset=full_off_np,
       pin=regions["pin"],
+      eye_residual_left=eye_tex_res["eye_left"].detach().cpu().numpy(),
+      eye_residual_right=eye_tex_res["eye_right"].detach().cpu().numpy(),
+      **({f"pupil_r_{s}": float(pupil_r[s].detach()) for s in pupil_r}),
   )
   trimesh.Trimesh(vertices=verts, faces=faces, process=False).export(args.out_dir / "frame_photo.obj")
   vis = stage_bgr.copy()
@@ -1300,6 +1714,11 @@ def _build_and_run(args) -> int:
   bary_t = torch.as_tensor(lmk_w, dtype=torch.float32)
   gt_t = torch.as_tensor(gt_xy)
 
+  # Pupil size = expression last dim (pupils=1). 0 = neutral; learned in eye L2.
+  _pup0 = (np.asarray(params["pupil"], np.float32).reshape(-1)[:1]
+           if "pupil" in params.files else np.zeros(1, np.float32))
+  state.pupil = torch.nn.Parameter(torch.as_tensor(_pup0, dtype=torch.float32), requires_grad=False)
+
   def posed_verts_world() -> torch.Tensor:
     return gnm(
         state.identity()[None],
@@ -1389,6 +1808,8 @@ def _build_and_run(args) -> int:
   if state.expr_w is not None:
     save_kw["expression_pca_w"] = state.expr_w.detach().cpu().numpy()
     save_kw["expression_pca_dim"] = np.int32(state.expr_w.numel())
+  if getattr(state, "pupil", None) is not None:
+    save_kw["pupil"] = state.pupil.detach().cpu().numpy().reshape(1)
   # Persist static offset = inherited base + learnable residual (NO sem_off;
   # ear/neck semantic stays in semantic_coef so consumers add it exactly once).
   if photo.get("static_offset_full") is not None:
@@ -1432,7 +1853,7 @@ def main() -> int:
   p.add_argument("--expr_lr", type=float, default=5e-2,
                  help="expr lr in photo rgb_init_all stage (smaller = more stable).")
   p.add_argument("--photo_offset_iters", type=int, default=500)
-  p.add_argument("--stop_after", choices=("tex", "rgb", "offset", "cheek"), default="tex")
+  p.add_argument("--stop_after", choices=("tex", "rgb", "offset", "cheek", "eye"), default="tex")
   p.add_argument("--freeze_cam_neck", action="store_true",
                  help="Freeze camera (focal/cam_aa/cam_t) and neck+head pose/translation in L1/L2; "
                       "still optimize shape/expression/texture/lights. Keeps a fitted neck-shoulder fixed.")
@@ -1447,6 +1868,21 @@ def main() -> int:
   p.add_argument("--eye_frame", type=int, default=0)
   p.add_argument("--eye_iters", type=int, default=60)
   p.add_argument("--eye_lr", type=float, default=2e-2)
+  p.add_argument("--eye_tex_iters", type=int, default=200,
+                 help="Eye stage L1 iterations: fit eye-region texture (sclera/iris/pupil color).")
+  p.add_argument("--eye_pupil_iters", type=int, default=120,
+                 help="Eye stage L2 iterations: fit pupil size (expression pupils dim).")
+  p.add_argument("--eye_tex_lr", type=float, default=5e-3)
+  p.add_argument("--eye_pupil_lr", type=float, default=5e-2)
+  p.add_argument("--eye_opt_id", type=int, default=1,
+                 help="Eye stage: also optimize id_eyes (identity) alongside texture/pupil. 0 disables.")
+  p.add_argument("--eye_opt_lights", type=int, default=0,
+                 help="Eye stage L1: also optimize lights. Default 0 (keep L2 lights so skin stays put).")
+  p.add_argument("--eye_pupil_radius_npz", type=Path, default=None,
+                 help="SAM3 pupil npz with centers[T,2,2]+radii[T,2]. Sets pupil radius r from SAM R.")
+  p.add_argument("--eye_pupil_mask", type=Path, default=None,
+                 help="Reuse an existing pupil mask npz (key 'mask'); computes center+radius via "
+                      "minEnclosingCircle. Preferred over --eye_pupil_radius_npz.")
   p.add_argument("--w_eye_anchor", type=float, default=40.0,
                  help="Anchor the eye joints to their pre-eye-fit value (gaze spin is unobservable "
                       "from one point; keep near the current gaze).")

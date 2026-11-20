@@ -298,6 +298,8 @@ class FitState:
   # 设上之后，表情只走这几条方向，ex_lower 本身不优化。
   expr_dirs: torch.Tensor | None = None
   expr_w: torch.Tensor | None = None
+  # 眼睛专属阶段的瞳孔大小（expression 最后一维 pupils=1）。None → 0。
+  pupil: torch.Tensor | None = None
 
   def expression(self) -> torch.Tensor:
     # 383 = left_eye 100 + right_eye 100 + lower_face 150 + tongue 32 + pupils 1.
@@ -315,12 +317,17 @@ class FitState:
       ex = self.ex_lower
       left = self.ex_left
       right = self.ex_right
+    pupil = (
+        self.pupil
+        if getattr(self, "pupil", None) is not None
+        else torch.zeros(1, dtype=ex.dtype, device=ex.device)
+    )
     return torch.cat([
         left,
         right,
         ex,
         torch.zeros(32, dtype=ex.dtype, device=ex.device),
-        torch.zeros(1, dtype=ex.dtype, device=ex.device),
+        pupil,
     ], dim=0)
 
   def rotations(self) -> torch.Tensor:
